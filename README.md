@@ -105,7 +105,7 @@ If you don't call `configure()`, the one-line `flag()` helper reads `FLAGGR_SERV
 
 ## Development
 
-You need Node.js 20 or later. The packages are npm workspaces, so the SDK builds against the evaluator in this repository.
+To build and test, you need Node.js 20.19 or a later 20.x, or Node.js 22.12 or later (Vitest 4 requires them). The packages are npm workspaces, so the SDK builds against the evaluator in this repository.
 
 ```bash
 npm ci

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * The browser bundle's entry configures the global client from its script
@@ -15,8 +15,12 @@ const DEFAULT_API_URL = "https://api.flaggr.dev";
 const json = (body: unknown) =>
   ({ ok: true, status: 200, json: async () => body }) as unknown as Response;
 
+/** A fetch mock that answers every evaluation request with `true`. */
+const evaluationFetch = () =>
+  vi.fn(async (_url: string, _init: RequestInit) => json({ value: true, reason: "STATIC" }));
+
 describe("browser bundle: script-tag configuration", () => {
-  let fetchMock: Mock<[string, RequestInit], Promise<Response>>;
+  let fetchMock: ReturnType<typeof evaluationFetch>;
   let tags: HTMLScriptElement[] = [];
   let bundle: BrowserBundle | undefined;
 
@@ -43,7 +47,7 @@ describe("browser bundle: script-tag configuration", () => {
   };
 
   beforeEach(() => {
-    fetchMock = vi.fn(async (_url: string, _init: RequestInit) => json({ value: true, reason: "STATIC" }));
+    fetchMock = evaluationFetch();
     vi.stubGlobal("fetch", fetchMock);
   });
 

@@ -51,7 +51,7 @@ function streamStub() {
     addEventListener: (name: string, fn: (event: MessageEvent) => void) => named.set(name, fn),
     close: vi.fn(),
   };
-  vi.stubGlobal("EventSource", vi.fn(() => source));
+  vi.stubGlobal("EventSource", vi.fn(function () { return source; }));
   return {
     /** A named data-plane event (configuration_sync, configuration_delta). */
     emit: (name: string, payload: unknown) =>

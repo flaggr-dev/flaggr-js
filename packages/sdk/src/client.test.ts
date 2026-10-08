@@ -248,7 +248,7 @@ describe("FlaggrClient local evaluation", () => {
       },
       close: vi.fn(),
     };
-    vi.stubGlobal("EventSource", vi.fn(() => mockSource));
+    vi.stubGlobal("EventSource", vi.fn(function () { return mockSource; }));
 
     // Keyless: EventSource. (With an apiKey the client streams over fetch.)
     const client = new FlaggrClient({
@@ -294,7 +294,7 @@ describe("FlaggrClient local evaluation", () => {
       },
       close: vi.fn(),
     };
-    vi.stubGlobal("EventSource", vi.fn(() => mockSource));
+    vi.stubGlobal("EventSource", vi.fn(function () { return mockSource; }));
 
     const client = new FlaggrClient({
       apiUrl: "https://flaggr.test",
@@ -345,7 +345,7 @@ describe("update modes", () => {
       addEventListener: vi.fn(),
       close: vi.fn(),
     };
-    const ctor = vi.fn(() => mockSource);
+    const ctor = vi.fn(function () { return mockSource; });
     vi.stubGlobal("EventSource", ctor);
     return { mockSource, ctor };
   };
@@ -703,7 +703,7 @@ describe("streaming with an API key", () => {
       addEventListener: vi.fn(),
       close: vi.fn(),
     };
-    const ctor = vi.fn((_url: string) => mockSource);
+    const ctor = vi.fn(function (_url: string) { return mockSource; });
     vi.stubGlobal("EventSource", ctor);
 
     const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "pixel-grid", updateMode: "stream" });
