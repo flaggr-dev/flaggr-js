@@ -16,35 +16,35 @@ npm install @flaggr/evaluator
 ## Usage
 
 ```typescript
-import { evaluate } from '@flaggr/evaluator'
+import { evaluateFlag } from '@flaggr/evaluator'
 
-const result = evaluate({
-  flag: {
+const result = evaluateFlag(
+  {
     key: 'checkout-v2',
     type: 'boolean',
     enabled: true,
     defaultValue: false,
-    targetingRules: [
+    targeting: [
       {
-        conditions: [{ attribute: 'plan', operator: 'equals', value: 'enterprise' }],
+        id: 'enterprise-customers',
+        conditions: [{ property: 'plan', operator: 'equals', value: 'enterprise' }],
         value: true,
       },
     ],
   },
-  context: {
-    targetingKey: 'user-123',
-    plan: 'enterprise',
-  },
-})
+  { targetingKey: 'user-123', plan: 'enterprise' },
+)
 
 console.log(result.value)  // true
 console.log(result.reason) // "TARGETING_MATCH"
 ```
 
+`evaluateFlags(flags, context)` evaluates a record of flags keyed by flag key, and `Evaluator.evaluate(flag, context)` is the same as `evaluateFlag`. Each result has a `value`, a `reason` and, when a variant was chosen, a `variant`.
+
 ## Features
 
 - Zero dependencies
-- Supports all 16 targeting operators
+- Gives the same results as Flaggr's data plane for the operators it implements: equals, not_equals, in, not_in, contains, starts_with, ends_with, greater_than, less_than, gte, lte, regex, before and after. `isLocallyEvaluable(flag)` tells you whether a flag uses only these. It also evaluates exists and not_exists. Cohort operators need the server.
 - Percentage rollouts with deterministic hashing
 - Variant assignment for experiments
 - Type-safe evaluation (boolean, string, number, object)
