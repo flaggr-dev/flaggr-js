@@ -1,0 +1,83 @@
+{
+  "name": "@flaggr/sdk",
+  "version": "0.5.0",
+  "description": "Flaggr feature flag SDK for TypeScript \u2014 type-safe evaluation with pluggable OpenTelemetry instrumentation",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.mjs",
+      "require": "./dist/react.js"
+    },
+    "./otel": {
+      "types": "./dist/otel.d.ts",
+      "import": "./dist/otel.mjs",
+      "require": "./dist/otel.js"
+    },
+    "./browser": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/browser.global.js",
+      "require": "./dist/browser.global.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "@opentelemetry/api": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "@opentelemetry/api": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "react": "^18.0.0",
+    "@opentelemetry/api": "^1.9.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "feature-flags",
+    "feature-toggles",
+    "openfeature",
+    "flaggr",
+    "opentelemetry",
+    "otel",
+    "typescript",
+    "react"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flaggr-dev/flaggr-js.git",
+    "directory": "packages/sdk"
+  },
+  "homepage": "https://flaggr.dev/docs/sdk/typescript-sdk",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@flaggr/evaluator": "0.3.0"
+  },
+  "unpkg": "./dist/browser.global.js",
+  "jsdelivr": "./dist/browser.global.js"
+}

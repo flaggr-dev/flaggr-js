@@ -1,0 +1,45 @@
+{
+  "name": "@flaggr/evaluator",
+  "version": "0.3.0",
+  "description": "Standalone flag evaluator for Flaggr - zero dependencies, pure TypeScript",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "feature-flags",
+    "flaggr",
+    "openfeature",
+    "evaluator"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flaggr-dev/flaggr-js.git",
+    "directory": "packages/evaluator"
+  },
+  "homepage": "https://flaggr.dev/docs/sdk/typescript-sdk",
+  "publishConfig": {
+    "access": "public"
+  }
+}

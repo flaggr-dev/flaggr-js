@@ -1,0 +1,29 @@
+{
+  "name": "flaggr-js",
+  "private": true,
+  "description": "Flaggr TypeScript SDK (@flaggr/sdk) and standalone flag evaluator (@flaggr/evaluator)",
+  "license": "MIT",
+  "homepage": "https://flaggr.dev/docs/sdk/typescript-sdk",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flaggr-dev/flaggr-js.git"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @flaggr/evaluator && npm run build -w @flaggr/sdk",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run typecheck && npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^20.0.1",
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.0",
+    "jsdom": "^20.0.3",
+    "vitest": "^1.6.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
