@@ -1,0 +1,12 @@
+# Keeps the pinned GitHub Actions in .github/workflows up to date.
+# The packages' npm dependencies are maintained in Flaggr's main repository
+# and synced here, so Dependabot doesn't open npm pull requests.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      github-actions:
+        patterns: ["*"]
