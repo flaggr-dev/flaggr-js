@@ -9,7 +9,7 @@ The TypeScript and JavaScript SDK for [Flaggr](https://flaggr.dev), an OpenFeatu
 | Package | What it is |
 |---------|------------|
 | [`@flaggr/sdk`](packages/sdk) | The client SDK for browsers, Node.js and edge runtimes: typed flag evaluation, polling or streaming updates, React hooks (`@flaggr/sdk/react`), OpenTelemetry instrumentation (`@flaggr/sdk/otel`) and a script-tag bundle. |
-| [`@flaggr/evaluator`](packages/evaluator) | The standalone, zero-dependency flag evaluator that the SDK uses for local evaluation. It applies targeting rules, percentage rollouts, variants, overrides and schedules by the same rules as Flaggr's data plane. You can also use it on its own to evaluate flag configuration you already have. |
+| [`@flaggr/evaluator`](packages/evaluator) | The standalone, zero-dependency flag evaluator that the SDK uses for local evaluation. It evaluates targeting rules, percentage rollouts, variants, overrides and schedules the same way Flaggr's data plane does. You can also use it on its own to evaluate flag configuration you already have. |
 
 ## Install
 
@@ -89,9 +89,9 @@ result.reason // "TARGETING_MATCH"
 
 ## Authentication
 
-The SDK authenticates with a project API token (`fgr_…`). To create one, go to **Project Settings > API Tokens** in the Flaggr console. A token with only the `read` permission can evaluate flags. Pass the token as `apiKey`.
+The SDK authenticates with a project API token (`fgr_…`). To create one, go to **Project Settings > API Tokens** in the Flaggr console, then pass it as `apiKey`. Evaluating flags needs only the `read` permission.
 
-Code that runs in a browser shows its token to anyone who loads the page, so give browser clients a token that has only the `read` permission. A `read` token can also read the project's flag configuration. Personal access tokens (`fgp_…`) can't evaluate flags.
+Code that runs in a browser shows its token to anyone who loads the page, so give browser clients a token with only the `read` permission. Such a token can also read the project's flag configuration. Personal access tokens (`fgp_…`) can't evaluate flags.
 
 If you don't call `configure()`, the one-line `flag()` helper reads `FLAGGR_SERVICE_ID`, `FLAGGR_API_KEY`, `FLAGGR_ENVIRONMENT` and `FLAGGR_API_URL` from `process.env`. See [API tokens](https://flaggr.dev/docs/api/tokens) for scopes and token management.
 
