@@ -10,6 +10,12 @@
  * the client's `apiKey`. Without one the plugin sends nothing, and once the
  * endpoint refuses the key (401/403) it stops sending.
  *
+ * The endpoint is the Flaggr app's (the control plane's), at the client's
+ * apiUrl — except for the hosted data plane, https://api.flaggr.dev (the
+ * client's default apiUrl), which serves only evaluation: from there batches
+ * go to https://flaggr.dev. A host that answers 404 or 405 serves no
+ * telemetry, so the plugin stops sending to it (set `endpoint`).
+ *
  * Usage:
  *   import { createFlaggr, flaggrTelemetry } from '@flaggr/sdk'
  *   const client = createFlaggr({
@@ -44,10 +50,43 @@ export interface TelemetryOptions {
    * preflight.
    */
   beacon?: boolean;
+  /**
+   * The URL batches are POSTed to. Default: `${apiUrl}/api/analytics/sdk-telemetry`,
+   * or https://flaggr.dev/api/analytics/sdk-telemetry when apiUrl is the hosted
+   * data plane (https://api.flaggr.dev), which serves only evaluation. Set it
+   * when apiUrl points at a self-hosted data plane: to the same path on the
+   * Flaggr app.
+   */
+  endpoint?: string;
 }
 
 /** Why telemetry stopped, already reported by console.warn. */
 const warned = new Set<string>();
+
+/** The hosted data plane (the client's default apiUrl): evaluation only, no telemetry endpoint. */
+const HOSTED_DATA_PLANE_HOST = "api.flaggr.dev";
+/** The hosted Flaggr app, which serves POST /api/analytics/sdk-telemetry. */
+const HOSTED_APP_ORIGIN = "https://flaggr.dev";
+const TELEMETRY_PATH = "/api/analytics/sdk-telemetry";
+
+/**
+ * Where a client's batches go (TelemetryOptions.endpoint). An unset apiUrl
+ * stands for the client's default, the hosted data plane: the hosted app's
+ * endpoint. An empty one (or "/") is the page's own origin, where the client
+ * evaluates too: the endpoint's path there.
+ */
+export function telemetryEndpoint(apiUrl: string | undefined, endpoint?: string): string {
+  if (endpoint) return endpoint;
+  if (apiUrl === undefined) return `${HOSTED_APP_ORIGIN}${TELEMETRY_PATH}`;
+  const base = apiUrl.replace(/\/+$/, "");
+  let host = "";
+  try {
+    host = new URL(base).hostname.toLowerCase();
+  } catch {
+    /* not an absolute URL: post next to it */
+  }
+  return `${host === HOSTED_DATA_PLANE_HOST ? HOSTED_APP_ORIGIN : base}${TELEMETRY_PATH}`;
+}
 
 /** Whether fetch() honours `keepalive` (Request#keepalive: Chrome 66, Safari 13, Firefox 133). */
 function keepaliveFetchSupported(): boolean {
@@ -109,6 +148,7 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
     vitals: captureVitals = true,
     errors: captureErrors = true,
     beacon = true,
+    endpoint,
   } = options;
 
   const flagStats = new Map<string, FlagAgg>();
@@ -211,10 +251,18 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
     }
   }
 
-  /** A refused key (401/403) won't be accepted on a retry: stop sending. */
-  function onResponse(response: Response) {
-    if (!refused && (response.status === 401 || response.status === 403)) {
+  /**
+   * A refused key (401/403) won't be accepted on a retry, and a host without
+   * the endpoint (404/405: a data plane, say) never will be: stop sending.
+   */
+  function onResponse(url: string, response: Response) {
+    if (refused) return;
+    if (response.status === 401 || response.status === 403) {
       stopSending(`/api/analytics/sdk-telemetry refused the apiKey (${response.status})`);
+    } else if (response.status === 404 || response.status === 405) {
+      stopSending(
+        `${url} doesn't serve telemetry (${response.status}); point flaggrTelemetry({ endpoint }) at the Flaggr app's ${TELEMETRY_PATH}`
+      );
     }
   }
 
@@ -224,10 +272,11 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
     if (!apiKey) return; // onInit stopped the plugin
     const { empty, batch } = payload();
     if (empty) return; // nothing accumulated — don't churn requests
-    const url = `${apiUrl}/api/analytics/sdk-telemetry`;
+    const url = telemetryEndpoint(apiUrl, endpoint);
+    const answered = (response: Response) => onResponse(url, response);
 
     const inBrowser = typeof window !== "undefined" && typeof document !== "undefined";
-    if (pageHide && beacon && inBrowser && sendOnPageHide(url, JSON.stringify({ ...batch, apiKey }), onResponse)) {
+    if (pageHide && beacon && inBrowser && sendOnPageHide(url, JSON.stringify({ ...batch, apiKey }), answered)) {
       return;
     }
     fetch(url, {
@@ -236,7 +285,7 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
       body: JSON.stringify(batch),
       keepalive: true,
     })
-      .then(onResponse)
+      .then(answered)
       .catch(() => {});
   }
 

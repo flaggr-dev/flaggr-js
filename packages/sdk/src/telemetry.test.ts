@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { flaggrTelemetry, type TelemetryOptions } from "./telemetry";
+import { flaggrTelemetry, telemetryEndpoint, type TelemetryOptions } from "./telemetry";
 import type { FlaggrClientInstance } from "./types";
 
 /**
@@ -18,9 +18,9 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function fakeClient(apiKey: string | undefined): FlaggrClientInstance {
+function fakeClient(apiKey: string | undefined, apiUrl = API_URL): FlaggrClientInstance {
   return {
-    getConfig: () => ({ apiUrl: API_URL, apiKey, serviceId: "web" }),
+    getConfig: () => ({ apiUrl, apiKey, serviceId: "web" }),
   } as unknown as FlaggrClientInstance;
 }
 
@@ -35,9 +35,9 @@ function stubPage(nav: Record<string, unknown>) {
 }
 
 /** The plugin, initialised (null: a client without an apiKey), with one evaluation accumulated. */
-function installed(apiKey: string | null = KEY, options: TelemetryOptions = {}) {
+function installed(apiKey: string | null = KEY, options: TelemetryOptions = {}, apiUrl = API_URL) {
   const plugin = flaggrTelemetry({ vitals: false, errors: false, ...options });
-  plugin.onInit?.(fakeClient(apiKey ?? undefined));
+  plugin.onInit?.(fakeClient(apiKey ?? undefined, apiUrl));
   plugin.onEvaluateComplete?.("new-nav", { value: true, reason: "STATIC", variant: "on" }, 2);
   return plugin;
 }
@@ -117,6 +117,33 @@ describe("flaggrTelemetry page-hide flush", () => {
     expect(JSON.parse(init!.body!).summaries).toHaveLength(1);
   });
 
+  it.each([401, 403])(
+    "stops sending when the page-hide request is refused with %i and the tab lives on",
+    async (status) => {
+      vi.useFakeTimers();
+      const { doc } = stubPage({ sendBeacon: vi.fn(() => true) });
+      const fetchMock = vi.fn(async (_url: string, _init?: FetchInit) => new Response(null, { status }));
+      vi.stubGlobal("fetch", fetchMock);
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const plugin = installed(KEY, { flushIntervalMs: 1000 });
+
+      // A tab switch: the page is hidden, not unloaded.
+      doc.visibilityState = "hidden";
+      doc.dispatchEvent(new Event("visibilitychange"));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][1]).toMatchObject({ keepalive: true, headers: { "Content-Type": "text/plain" } });
+      await vi.advanceTimersByTimeAsync(0); // the refusal arrives
+
+      doc.visibilityState = "visible";
+      plugin.onEvaluateComplete?.("new-nav", { value: false, reason: "STATIC", variant: "off" }, 1);
+      await vi.advanceTimersByTimeAsync(5000);
+      plugin.onDestroy?.();
+
+      // A refused key won't be accepted on a retry.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+  );
+
   it("with beacon: false, sends the page-hide batch as a regular request with the bearer header", () => {
     const sendBeacon = vi.fn(() => true);
     const { win } = stubPage({ sendBeacon });
@@ -183,6 +210,26 @@ describe("flaggrTelemetry periodic flush", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([404, 405])(
+    "stops sending once the host answers %i (it serves no telemetry) and says to set endpoint",
+    async (status) => {
+      vi.useFakeTimers();
+      const fetchMock = vi.fn(async (_url: string, _init?: FetchInit) => new Response(null, { status }));
+      vi.stubGlobal("fetch", fetchMock);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const plugin = installed(KEY, { flushIntervalMs: 1000 }, "https://flaggr-api.internal.example");
+
+      await vi.advanceTimersByTimeAsync(1000);
+      plugin.onEvaluateComplete?.("new-nav", { value: false, reason: "STATIC", variant: "off" }, 1);
+      await vi.advanceTimersByTimeAsync(5000);
+      plugin.onDestroy?.();
+
+      // The batch would never be stored there: no request every flushIntervalMs for the page's lifetime.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("endpoint"));
+    }
+  );
+
   it("keeps sending after a server error", async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn(async (_url: string, _init?: FetchInit) => new Response(null, { status: 503 }));
@@ -195,5 +242,75 @@ describe("flaggrTelemetry periodic flush", () => {
     plugin.onDestroy?.();
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * The hosted data plane (https://api.flaggr.dev, the client's default apiUrl)
+ * serves only evaluation: POST /api/analytics/sdk-telemetry is the Flaggr
+ * app's. A batch posted next to that apiUrl gets a 404, forever.
+ */
+describe("flaggrTelemetry endpoint", () => {
+  it("sends the hosted data plane's batches to the Flaggr app", async () => {
+    vi.useFakeTimers();
+    const sendBeacon = vi.fn(() => true);
+    const { win } = stubPage({ sendBeacon });
+    const fetchMock = okFetch();
+    const plugin = installed(KEY, { flushIntervalMs: 1000 }, "https://api.flaggr.dev");
+
+    await vi.advanceTimersByTimeAsync(1000);
+    plugin.onEvaluateComplete?.("new-nav", { value: false, reason: "STATIC", variant: "off" }, 1);
+    win.dispatchEvent(new Event("pagehide"));
+    plugin.onDestroy?.();
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "https://flaggr.dev/api/analytics/sdk-telemetry",
+      "https://flaggr.dev/api/analytics/sdk-telemetry",
+    ]);
+    expect(sendBeacon).not.toHaveBeenCalled();
+  });
+
+  it("sends batches to the endpoint option when it is set", async () => {
+    vi.useFakeTimers();
+    const fetchMock = okFetch();
+    const plugin = installed(
+      KEY,
+      { flushIntervalMs: 1000, endpoint: "https://flags.example.com/api/analytics/sdk-telemetry" },
+      "https://flags-data.example.com"
+    );
+
+    await vi.advanceTimersByTimeAsync(1000);
+    plugin.onDestroy?.();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("https://flags.example.com/api/analytics/sdk-telemetry");
+  });
+
+  it.each([
+    ["https://api.flaggr.dev", "https://flaggr.dev/api/analytics/sdk-telemetry"],
+    ["https://api.flaggr.dev/", "https://flaggr.dev/api/analytics/sdk-telemetry"],
+    ["https://API.flaggr.dev:8443", "https://flaggr.dev/api/analytics/sdk-telemetry"],
+    ["https://flaggr.dev", "https://flaggr.dev/api/analytics/sdk-telemetry"],
+    ["http://localhost:3000/", "http://localhost:3000/api/analytics/sdk-telemetry"],
+    ["https://flags.example.com", "https://flags.example.com/api/analytics/sdk-telemetry"],
+  ])("apiUrl %s posts to %s", (apiUrl, expected) => {
+    expect(telemetryEndpoint(apiUrl)).toBe(expected);
+  });
+
+  it("posts to the page's own origin when apiUrl is empty, where the client evaluates too", async () => {
+    vi.useFakeTimers();
+    const fetchMock = okFetch();
+    // `apiUrl: ""`: the client evaluates at the page's own /api/flags/evaluate (a same-origin proxy).
+    const plugin = installed(KEY, { flushIntervalMs: 1000 }, "");
+
+    await vi.advanceTimersByTimeAsync(1000);
+    plugin.onDestroy?.();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/analytics/sdk-telemetry");
+  });
+
+  it("posts to the Flaggr app when apiUrl is unset (the client's default is the hosted data plane)", () => {
+    expect(telemetryEndpoint(undefined)).toBe("https://flaggr.dev/api/analytics/sdk-telemetry");
   });
 });
