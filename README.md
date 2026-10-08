@@ -9,7 +9,7 @@ The TypeScript and JavaScript SDK for [Flaggr](https://flaggr.dev), an OpenFeatu
 | Package | What it is |
 |---------|------------|
 | [`@flaggr/sdk`](packages/sdk) | The client SDK for browsers, Node.js and edge runtimes: typed flag evaluation, polling or streaming updates, React hooks (`@flaggr/sdk/react`), OpenTelemetry instrumentation (`@flaggr/sdk/otel`) and a script-tag bundle. |
-| [`@flaggr/evaluator`](packages/evaluator) | The standalone, zero-dependency flag evaluator that the SDK uses for local evaluation. It evaluates targeting rules, percentage rollouts, variants, overrides and schedules the same way Flaggr's data plane does. You can also use it on its own to evaluate flag configuration you already have. |
+| [`@flaggr/evaluator`](packages/evaluator) | The standalone, zero-dependency flag evaluator that the SDK uses for local evaluation. It evaluates targeting rules, percentage rollouts, variants, overrides and schedules the same way Flaggr's data plane does for the operators the data plane implements (`isLocallyEvaluable(flag)` tells you whether a flag uses only those). You can also use it on its own to evaluate flag configuration you already have. |
 
 ## Install
 
@@ -17,7 +17,7 @@ The TypeScript and JavaScript SDK for [Flaggr](https://flaggr.dev), an OpenFeatu
 npm install @flaggr/sdk
 ```
 
-Use `@flaggr/sdk` 0.5.0 or later. Versions 0.3.0 and 0.4.0 fail to load as ES modules. The script-tag bundle isn't affected.
+Use `@flaggr/sdk` 0.5.0 or later. Until 0.5.0 is on npm (check with `npm view @flaggr/sdk version`), `npm install @flaggr/sdk` installs 0.4.0. That version can't be imported as an ES module, and loaded with `require()` it can't evaluate flags locally; 0.3.0 has the same problems. The script-tag bundle isn't affected.
 
 ## Usage
 
@@ -89,7 +89,7 @@ result.reason // "TARGETING_MATCH"
 
 ## Authentication
 
-The SDK authenticates with a project API token (`fgr_…`). To create one, go to **Project Settings > API Tokens** in the Flaggr console, then pass it as `apiKey`. Evaluating flags needs only the `read` permission.
+The SDK authenticates with a project API token (`fgr_…`). To create one, open your project's **Settings → API tokens** in the Flaggr console, then pass it as `apiKey`. Evaluating flags needs only the `read` permission.
 
 Code that runs in a browser shows its token to anyone who loads the page, so give browser clients a token with only the `read` permission. Such a token can also read the project's flag configuration. Personal access tokens (`fgp_…`) can't evaluate flags.
 
@@ -119,7 +119,7 @@ This repository is synced from Flaggr's main repository at each release. New ver
 
 ## Security
 
-Please don't report security vulnerabilities in public issues. Email them to [security@flaggr.dev](mailto:security@flaggr.dev).
+Please don't report security vulnerabilities in public issues. Report them privately with GitHub's [Report a vulnerability](https://github.com/flaggr-dev/flaggr-js/security/advisories/new) button, or email [security@flaggr.dev](mailto:security@flaggr.dev). See [SECURITY.md](SECURITY.md).
 
 ## License
 
