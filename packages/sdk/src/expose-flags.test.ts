@@ -309,21 +309,26 @@ describe("exposeFlags: publishing resolved values for browser analytics", () => 
   });
 
   it("keeps the last resolved value when a later evaluation fails", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(json({ value: "treatment", reason: "TARGETING_MATCH" }))
-      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+    let answer: "treatment" | "offline" | "left out" | "error" = "treatment";
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      if (answer === "offline") throw new TypeError("Failed to fetch");
+      if (answer === "treatment") return json({ value: "treatment", reason: "TARGETING_MATCH" });
+      if (!String(url).endsWith("/batch")) throw new Error(`unexpected request to ${String(url)}`);
       // Batch answers that don't resolve the flag: one leaves it out (the
       // SDK's "Flag missing from batch response"), one reports an error.
-      .mockResolvedValueOnce(json({ flags: {}, total: 0 }))
-      .mockResolvedValueOnce(json({ flags: [{ key: "copy", reason: "ERROR" }] }));
+      return json(answer === "left out" ? { flags: {}, total: 0 } : { flags: [{ key: "copy", reason: "ERROR" }] });
+    });
     vi.stubGlobal("fetch", fetchMock);
     const client = new FlaggrClient({ apiUrl: API, serviceId: "web" });
 
     await expect(client.getStringValue("copy", "control")).resolves.toBe("treatment");
-    await client.refresh(); // drop the cache: the next read goes to the network
+    answer = "offline";
+    // The refresh fails: the cached value is dropped, so the next read goes
+    // to the network, and fails too.
+    await client.refresh();
     await expect(client.getStringValue("copy", "control")).resolves.toBe("control");
-    for (let i = 0; i < 2; i++) {
+    for (const next of ["left out", "error"] as const) {
+      answer = next;
       await client.refresh();
       const bulk = await client.evaluateBatch([{ flagKey: "copy", defaultValue: "control" }]);
       expect(bulk.get("copy")).toMatchObject({ value: "control", reason: "ERROR" });
@@ -332,7 +337,10 @@ describe("exposeFlags: publishing resolved values for browser analytics", () => 
     }
     await settle();
 
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    // The evaluation, the failed refresh and read, then a batch each for the
+    // two answers (nothing was cached for the first refresh to ask about),
+    // and the second refresh's batch.
+    expect(fetchMock).toHaveBeenCalledTimes(6);
     expect(page.__FLAGGR_FLAGS__).toEqual({ copy: "treatment" });
     expect(events).toHaveLength(1);
     client.destroy();
@@ -1787,5 +1795,28 @@ describe.skipIf(!existsSync(analyticsScriptSources))("with the analytics script'
     expect(analytics.shouldCollect("scroll")).toBe(false);
     levels.destroy();
     config.destroy();
+  });
+});
+
+describe("exposeFlags and refresh()", () => {
+  it("doesn't publish a flag the page evaluated only for someone else: a refresh doesn't evaluate it for the page's user", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { context: { targetingKey?: string }; flags?: Array<{ key: string }> };
+      const value = body.context.targetingKey === "admin" ? "admin-copy" : "customer-copy";
+      if (String(url).endsWith("/batch")) return json({ flags: body.flags!.map(({ key }) => ({ key, value, reason: "STATIC" })) });
+      return json({ value, reason: "STATIC" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    // An admin's page previewing a flag for a customer.
+    const client = new FlaggrClient({ apiUrl: API, serviceId: "web", context: { targetingKey: "admin" } });
+    await expect(client.getStringValue("copy", "none", { targetingKey: "customer-42" })).resolves.toBe("customer-copy");
+
+    await client.refresh();
+    await settle();
+
+    expect(page.__FLAGGR_FLAGS__).toBeUndefined();
+    expect(events).toHaveLength(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    client.destroy();
   });
 });

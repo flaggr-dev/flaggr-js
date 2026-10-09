@@ -46,7 +46,9 @@ console.log(result.reason) // "TARGETING_MATCH"
 - Zero dependencies
 - Gives the same results as Flaggr's data plane for the operators it implements: equals, not_equals, in, not_in, contains, starts_with, ends_with, greater_than, less_than, gte, lte, regex, before and after. `isLocallyEvaluable(flag)` tells you whether a flag uses only these. It also evaluates exists and not_exists. Cohort operators need the server.
 - Percentage rollouts with deterministic hashing
-- Variant assignment for experiments
+- Targeting rules match as on the Flaggr data plane. A rule's condition groups, when it has them, decide (a group without conditions matches nobody); otherwise its conditions do, and a rule with no conditions matches everyone, so `conditions: []` with `rolloutPercentage: 10` serves the rule's value to 10% of all users. A context without a `targetingKey` is never in a rollout below 100%. Flaggr stores percentages and weights as whole numbers from 0 to 100. (Deployments of `api.flaggr.dev` from before Flaggr 0.5.0 match a rule with no conditions to nobody.)
+- Reads flags as the data plane encodes them (`/api/flags/export`, its SSE configuration events): a field encoded as `null` is unset, as is `""` in `conditionOperator`, `groupOperator` and `variant`. So a rule whose `rolloutPercentage` is `null` serves everyone it matches, and one whose `value` is `null` serves the flag's default. An entry of `targeting` or `overrides` that isn't an object is skipped.
+- Variant splits by targeting key (a running Flaggr experiment assigns its variants only on the control plane, not here)
 - Type-safe evaluation (boolean, string, number, object)
 
 ## Documentation

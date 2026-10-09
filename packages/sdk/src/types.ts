@@ -19,7 +19,12 @@ export interface EvaluationContext {
 export interface EvaluationResult<T extends FlagValue = FlagValue> {
   /** The evaluated flag value */
   value: T;
-  /** Reason for the evaluation result */
+  /**
+   * Reason for the evaluation result. The data plane (https://api.flaggr.dev)
+   * answers a flag it doesn't have with FLAG_NOT_FOUND, the control plane
+   * (https://flaggr.dev) with NOT_FOUND; EXPERIMENT, PREREQUISITE_FAILED and
+   * MUTUAL_EXCLUSION come from the control plane's evaluator.
+   */
   reason:
     | "STATIC"
     | "DEFAULT"
@@ -29,6 +34,10 @@ export interface EvaluationResult<T extends FlagValue = FlagValue> {
     | "SPLIT"
     | "DISABLED"
     | "NOT_FOUND"
+    | "FLAG_NOT_FOUND"
+    | "EXPERIMENT"
+    | "PREREQUISITE_FAILED"
+    | "MUTUAL_EXCLUSION"
     | "ERROR";
   /** Variant key if applicable */
   variant?: string;
@@ -85,7 +94,12 @@ export interface RequestInfo {
 export interface FlaggrPlugin {
   /** Plugin name for identification */
   name: string;
-  /** Called when the SDK is initialized */
+  /**
+   * Called when the SDK is initialized, before any other hook. A client
+   * created with `{ start: false }` (FlaggrProvider's) initializes in
+   * start(): what it evaluated or requested before then reaches the other
+   * hooks right after onInit, in order.
+   */
   onInit?(client: FlaggrClientInstance): void;
   /** Called before each flag evaluation */
   onEvaluate?(flagKey: string, context?: EvaluationContext): void;
@@ -111,7 +125,12 @@ export interface FlaggrPlugin {
  * SDK configuration
  */
 export interface FlaggrConfig {
-  /** Flaggr API URL (defaults to https://flaggr.dev) */
+  /**
+   * Where the client evaluates flags (default: https://api.flaggr.dev, the
+   * hosted data plane). The Flaggr app's routes it also calls
+   * (/api/sdk-config, /api/events/outcomes, /api/analytics/sdk-telemetry) go
+   * to https://flaggr.dev when apiUrl is the hosted data plane, else to apiUrl.
+   */
   apiUrl?: string;
   /** Service identifier */
   serviceId: string;
@@ -140,10 +159,18 @@ export interface FlaggrConfig {
    * When provided, flags evaluate locally with zero network on first paint.
    */
   bootstrap?: Record<string, unknown>;
-  /** Default values for flags (used when offline or on error) */
+  /**
+   * Fallback values by flag key, returned instead of the method-level
+   * default wherever the client would return that default: the evaluation
+   * fails (offline, an HTTP error, a refused key), the flag isn't found, or,
+   * for `evaluateSync`, nothing has loaded yet. A flag listed here is still
+   * evaluated as usual: its entry never replaces a result.
+   */
   defaults?: Record<string, FlagValue>;
   /**
-   * Fetch service-level SDK config from GET /api/sdk-config on init —
+   * Fetch service-level SDK config from the Flaggr app's GET /api/sdk-config on init
+   * (https://flaggr.dev when apiUrl is the hosted data plane, https://api.flaggr.dev,
+   * which serves only evaluation; otherwise the apiUrl) —
    * environment, updateMode, telemetry, cacheTtl come from Flaggr instead
    * of being repeated in client code. Explicit fields in this config win;
    * remote values fill gaps. Cached in localStorage with stale-while-
@@ -232,6 +259,19 @@ export interface OutcomeEvent {
   eventValue?: number;
   /** Optional user identifier (will be SHA-256 hashed server-side) */
   userId?: string;
+  /**
+   * The targeting key of the evaluation the outcome follows: the event
+   * carries the variant this client last evaluated for the flag with this
+   * targetingKey. Default: `userId`, then the client's own targetingKey (its
+   * `context`). Not sent.
+   */
+  targetingKey?: string;
+  /**
+   * The variant the user saw, when the caller knows it (say a server that
+   * evaluated the flag elsewhere). Default: the one this client last
+   * evaluated for the flag and targetingKey, else "unknown".
+   */
+  variant?: string;
 }
 
 /**
@@ -256,8 +296,8 @@ export interface FlaggrClientInstance {
     defaultValue: number,
     context?: EvaluationContext
   ): Promise<number>;
-  /** Evaluate an object flag */
-  getObjectValue<T extends Record<string, unknown>>(
+  /** Evaluate an object flag (T may be an interface: any object type) */
+  getObjectValue<T extends object>(
     flagKey: string,
     defaultValue: T,
     context?: EvaluationContext
@@ -306,11 +346,38 @@ export interface FlaggrClientInstance {
    * Clear all persisted SDK state for this service (remote settings +
    * flag snapshots across all environments/scopes). Next load re-fetches
    * everything — use for key rotation or recovering from bad cache state.
+   * Optional, so an implementation written for 0.4.0, which didn't have it,
+   * still is one: FlaggrClient always has it (`client.clearPersistedConfig?.()`
+   * on this type).
    */
-  clearPersistedConfig(): void;
-  /** Force refresh all flags */
+  clearPersistedConfig?(): void;
+  /**
+   * Force refresh all flags: re-evaluate, with the client's own context and
+   * in one batched request (flags it holds the configuration of evaluate
+   * locally), every flag this client has cached for that context or watches
+   * with `onFlagChange`, and notify the listeners of each flag whose value
+   * changed. Resolves once that's done. Results cached for per-call
+   * contexts are dropped: those go to the network again at their next call,
+   * as does a flag the refresh can't resolve (the request fails, or the
+   * flag isn't found), which notifies nobody. A flag only cached for
+   * per-call contexts, and not watched, isn't evaluated for the client's own
+   * context. (A React hook with a per-call context evaluates again, for its
+   * context, when its flag's listeners are notified.)
+   */
   refresh(): Promise<void>;
-  /** Track an outcome event for passive experiment analysis */
+  /**
+   * Track an outcome event for passive experiment analysis: POSTed to the
+   * Flaggr app's /api/events/outcomes with the client's apiKey as a bearer,
+   * on a keepalive request (it outlives the page) when the body fits the
+   * browser's 64 KiB keepalive budget. Never throws.
+   *
+   * In a browser the request is sent at once, and a CORS preflight goes
+   * first: the returned promise settles after both round trips, so don't
+   * await it before navigating away (the keepalive request arrives anyway).
+   * When the page is closing, call it from a `visibilitychange` handler
+   * (document hidden) rather than `pagehide`: some browsers drop requests
+   * started in `pagehide` when a tab is closed.
+   */
   trackOutcome(event: OutcomeEvent): Promise<void>;
   /** Destroy the client and clean up resources */
   destroy(): void;

@@ -70,10 +70,11 @@ export interface Condition {
 
 /**
  * Condition group — conditions AND together, groups combine via the rule's
- * groupOperator (Go evaluator parity).
+ * groupOperator (Go evaluator parity). A group without conditions matches
+ * nobody.
  */
 export interface ConditionGroup {
-  conditions: Condition[];
+  conditions: Condition[] | null;
 }
 
 /**
@@ -81,7 +82,7 @@ export interface ConditionGroup {
  */
 export interface ScheduleRecurrence {
   type?: string; // "daily" | "weekly"
-  daysOfWeek?: number[]; // 0=Sunday
+  daysOfWeek?: number[] | null; // 0=Sunday
   startTime?: string; // "HH:MM"
   endTime?: string; // "HH:MM"
 }
@@ -92,22 +93,30 @@ export interface ScheduleRecurrence {
 export interface RuleSchedule {
   startDate?: string; // RFC3339
   endDate?: string; // RFC3339
-  recurrence?: ScheduleRecurrence;
+  recurrence?: ScheduleRecurrence | null;
 }
 
 /**
- * Targeting rule with conditions and resulting value/variant
+ * Targeting rule with conditions and resulting value/variant. Groups, when
+ * present, decide whether it matches; otherwise its conditions do, and a rule
+ * with neither (`conditions: []`) matches every context.
+ *
+ * The data plane's JSON (/api/flags/export, its SSE configuration events)
+ * writes every field: an unset one as null, or as "" for conditionOperator,
+ * groupOperator and variant. Both read as unset.
  */
 export interface TargetingRule {
   id: string;
-  conditions: Condition[];
+  conditions?: Condition[] | null;
   conditionOperator?: "and" | "or"; // Default: "and"
-  groups?: ConditionGroup[];
+  groups?: ConditionGroup[] | null;
   groupOperator?: "and" | "or"; // Default: "or"
   variant?: string;
-  value?: FlagValue;
-  rolloutPercentage?: number;
-  schedule?: RuleSchedule;
+  /** Unset: the rule serves the flag's default value. */
+  value?: FlagValue | null;
+  /** Share of targeting keys (0-100, whole numbers) the rule serves; unset serves all. */
+  rolloutPercentage?: number | null;
+  schedule?: RuleSchedule | null;
 }
 
 /**
@@ -129,9 +138,9 @@ export interface FlagConfig {
   type: FlagType;
   enabled: boolean;
   defaultValue: FlagValue;
-  variants?: FlagVariant[];
-  targeting?: TargetingRule[];
-  overrides?: FlagOverride[];
+  variants?: FlagVariant[] | null;
+  targeting?: TargetingRule[] | null;
+  overrides?: FlagOverride[] | null;
 }
 
 /**

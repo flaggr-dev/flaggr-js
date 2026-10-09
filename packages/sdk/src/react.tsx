@@ -7,7 +7,7 @@
  *
  * function App() {
  *   return (
- *     <FlaggrProvider apiKey="flg_xxx" serviceId="web">
+ *     <FlaggrProvider apiKey="fgr_xxx" serviceId="web">
  *       <MyComponent />
  *     </FlaggrProvider>
  *   )
@@ -51,14 +51,14 @@ const FlaggrContext = createContext<FlaggrClientInstance | null>(null);
  *
  * @example Flat props (recommended)
  * ```tsx
- * <FlaggrProvider apiKey="flg_xxx" serviceId="my-app">
+ * <FlaggrProvider apiKey="fgr_xxx" serviceId="my-app">
  *   <App />
  * </FlaggrProvider>
  * ```
  *
  * @example Config object
  * ```tsx
- * <FlaggrProvider config={{ serviceId: 'my-app', apiKey: 'flg_xxx', enableStreaming: true }}>
+ * <FlaggrProvider config={{ serviceId: 'my-app', apiKey: 'fgr_xxx', enableStreaming: true }}>
  *   <App />
  * </FlaggrProvider>
  * ```
@@ -76,21 +76,43 @@ export function FlaggrProvider({
   config?: FlaggrConfig;
   children: ReactNode;
 }) {
-  const clientRef = useRef<FlaggrClient | null>(null);
+  // The props a replacement client is created from (see the second effect):
+  // the latest committed ones. This effect runs before that one.
+  const props = { apiKey, serviceId, environment, config };
+  const propsRef = useRef(props);
+  useEffect(() => {
+    propsRef.current = props;
+  });
 
-  if (!clientRef.current) {
-    const resolved = resolveProviderConfig({ apiKey, serviceId, environment, config });
-    clientRef.current = new FlaggrClient(resolved);
-  }
+  // Created while rendering but not started: no plugin onInit, remote config
+  // fetch, stream or timer. A render React throws away (Strict Mode renders
+  // twice in development; a server render never commits) leaves nothing
+  // running, and the server never opens a stream. Children can evaluate
+  // synchronously (bootstrap, cache) from the first render.
+  const [client, setClient] = useState(
+    () => new FlaggrClient(resolveProviderConfig(props), { start: false })
+  );
+  /** The client this effect's cleanup destroyed last. */
+  const destroyedRef = useRef<FlaggrClient | null>(null);
 
   useEffect(() => {
+    if (destroyedRef.current === client) {
+      // Mounted again after the cleanup destroyed the client: Strict Mode
+      // does that once after the first mount in development, as does an
+      // <Activity> shown again. Replace it; this effect runs again for the
+      // new client and starts it.
+      setClient(new FlaggrClient(resolveProviderConfig(propsRef.current), { start: false }));
+      return;
+    }
+    client.start();
     return () => {
-      clientRef.current?.destroy();
+      client.destroy();
+      destroyedRef.current = client;
     };
-  }, []);
+  }, [client]);
 
   return (
-    <FlaggrContext.Provider value={clientRef.current}>
+    <FlaggrContext.Provider value={client}>
       {children}
     </FlaggrContext.Provider>
   );
@@ -143,6 +165,56 @@ export function useFlaggr(): FlaggrClientInstance {
   return client;
 }
 
+/** Whether a hook's per-call context sets anything (`{}` is the client's own context). */
+function hasOwnContext(context: EvaluationContext | undefined): boolean {
+  return context !== undefined && Object.keys(context).length > 0;
+}
+
+/**
+ * A hook's effect: evaluate its flag, then follow the flag's changes. A
+ * change event carries the flag's value for the client's own context, so a
+ * hook with a per-call context (or an event without a value, such as a
+ * deletion) evaluates again, with its own context, instead of taking it.
+ * Only the newest answer is kept: an evaluation still on its way when a
+ * newer one starts, or a newer value arrives, is dropped.
+ */
+function followFlag<T>(
+  client: FlaggrClientInstance,
+  flagKey: string,
+  contextRef: { readonly current: EvaluationContext | undefined },
+  evaluate: (context: EvaluationContext | undefined) => Promise<T>,
+  accepts: (value: FlagValue) => boolean,
+  setValue: (value: T) => void
+): () => void {
+  let mounted = true;
+  let latest = 0;
+  const reevaluate = () => {
+    const call = ++latest;
+    evaluate(contextRef.current).then(
+      (value) => {
+        if (mounted && call === latest) setValue(value);
+      },
+      () => {
+        /* evaluation errors resolve to the fallback; a throwing plugin keeps the value */
+      }
+    );
+  };
+  reevaluate();
+  const unsubscribe = client.onFlagChange(flagKey, (event) => {
+    if (!mounted) return;
+    if (hasOwnContext(contextRef.current) || event.newValue === undefined) {
+      reevaluate();
+    } else if (accepts(event.newValue)) {
+      latest++;
+      setValue(event.newValue as T);
+    }
+  });
+  return () => {
+    mounted = false;
+    unsubscribe();
+  };
+}
+
 // --- Generic hook ---
 
 /**
@@ -188,22 +260,18 @@ export function useFlag<T extends FlagValue = boolean>(
   const contextRef = useRef(context);
   contextRef.current = context;
 
-  useEffect(() => {
-    let mounted = true;
-
-    client.evaluate<T>(flagKey, def, contextRef.current).then((result) => {
-      if (mounted) setValue(result.value);
-    });
-
-    const unsub = client.onFlagChange(flagKey, (event) => {
-      if (mounted) setValue(event.newValue as T);
-    });
-
-    return () => {
-      mounted = false;
-      unsub();
-    };
-  }, [client, flagKey, def]);
+  useEffect(
+    () =>
+      followFlag(
+        client,
+        flagKey,
+        contextRef,
+        (ctx) => client.evaluate<T>(flagKey, def, ctx).then((result) => result.value),
+        () => true,
+        setValue
+      ),
+    [client, flagKey, def]
+  );
 
   return value;
 }
@@ -226,26 +294,18 @@ export function useBooleanFlag(
   const contextRef = useRef(context);
   contextRef.current = context;
 
-  useEffect(() => {
-    let mounted = true;
-
-    client
-      .getBooleanValue(flagKey, defaultValue, contextRef.current)
-      .then((v) => {
-        if (mounted) setValue(v);
-      });
-
-    const unsub = client.onFlagChange(flagKey, (event) => {
-      if (mounted && typeof event.newValue === "boolean") {
-        setValue(event.newValue);
-      }
-    });
-
-    return () => {
-      mounted = false;
-      unsub();
-    };
-  }, [client, flagKey, defaultValue]);
+  useEffect(
+    () =>
+      followFlag(
+        client,
+        flagKey,
+        contextRef,
+        (ctx) => client.getBooleanValue(flagKey, defaultValue, ctx),
+        (value) => typeof value === "boolean",
+        setValue
+      ),
+    [client, flagKey, defaultValue]
+  );
 
   return value;
 }
@@ -266,26 +326,18 @@ export function useStringFlag(
   const contextRef = useRef(context);
   contextRef.current = context;
 
-  useEffect(() => {
-    let mounted = true;
-
-    client
-      .getStringValue(flagKey, defaultValue, contextRef.current)
-      .then((v) => {
-        if (mounted) setValue(v);
-      });
-
-    const unsub = client.onFlagChange(flagKey, (event) => {
-      if (mounted && typeof event.newValue === "string") {
-        setValue(event.newValue);
-      }
-    });
-
-    return () => {
-      mounted = false;
-      unsub();
-    };
-  }, [client, flagKey, defaultValue]);
+  useEffect(
+    () =>
+      followFlag(
+        client,
+        flagKey,
+        contextRef,
+        (ctx) => client.getStringValue(flagKey, defaultValue, ctx),
+        (value) => typeof value === "string",
+        setValue
+      ),
+    [client, flagKey, defaultValue]
+  );
 
   return value;
 }
@@ -306,66 +358,50 @@ export function useNumberFlag(
   const contextRef = useRef(context);
   contextRef.current = context;
 
-  useEffect(() => {
-    let mounted = true;
-
-    client
-      .getNumberValue(flagKey, defaultValue, contextRef.current)
-      .then((v) => {
-        if (mounted) setValue(v);
-      });
-
-    const unsub = client.onFlagChange(flagKey, (event) => {
-      if (mounted && typeof event.newValue === "number") {
-        setValue(event.newValue);
-      }
-    });
-
-    return () => {
-      mounted = false;
-      unsub();
-    };
-  }, [client, flagKey, defaultValue]);
+  useEffect(
+    () =>
+      followFlag(
+        client,
+        flagKey,
+        contextRef,
+        (ctx) => client.getNumberValue(flagKey, defaultValue, ctx),
+        (value) => typeof value === "number",
+        setValue
+      ),
+    [client, flagKey, defaultValue]
+  );
 
   return value;
 }
 
 /**
- * Evaluate a typed object feature flag
+ * Evaluate a typed object feature flag (T may be an interface: any object type)
  */
-export function useObjectFlag<T extends Record<string, unknown>>(
+export function useObjectFlag<T extends object>(
   flagKey: string,
   defaultValue: T,
   context?: EvaluationContext
 ): T {
   const client = useFlaggr();
   const [value, setValue] = useState<T>(
-    () => client.evaluateSync<T>(flagKey, defaultValue, context).value
+    () => client.evaluateSync<T & FlagValue>(flagKey, defaultValue as T & FlagValue, context).value
   );
 
   const contextRef = useRef(context);
   contextRef.current = context;
 
-  useEffect(() => {
-    let mounted = true;
-
-    client
-      .getObjectValue<T>(flagKey, defaultValue, contextRef.current)
-      .then((v) => {
-        if (mounted) setValue(v);
-      });
-
-    const unsub = client.onFlagChange(flagKey, (event) => {
-      if (mounted && typeof event.newValue === "object" && event.newValue !== null) {
-        setValue(event.newValue as T);
-      }
-    });
-
-    return () => {
-      mounted = false;
-      unsub();
-    };
-  }, [client, flagKey, defaultValue]);
+  useEffect(
+    () =>
+      followFlag(
+        client,
+        flagKey,
+        contextRef,
+        (ctx) => client.getObjectValue<T>(flagKey, defaultValue, ctx),
+        (value) => typeof value === "object" && value !== null,
+        setValue
+      ),
+    [client, flagKey, defaultValue]
+  );
 
   return value;
 }
@@ -387,7 +423,13 @@ export function useConnectionState(): ConnectionState {
 }
 
 /**
- * Get a refresh function to force-refresh all flags
+ * Get a refresh function to force-refresh all flags: it re-evaluates the
+ * flags the client has cached or watches (the hooks watch theirs), and the
+ * hooks of flags whose value changed re-render (see `refresh()`). A hook with
+ * a per-call context evaluates again, for that context, when its flag's
+ * value changes for the client's own context (or the client had none
+ * cached for it): give the provider the user's context (`config.context`)
+ * rather than each hook, and every hook follows every change.
  */
 export function useRefreshFlags(): () => Promise<void> {
   const client = useFlaggr();

@@ -8,7 +8,7 @@
  *
  * const client = createFlaggr({
  *   serviceId: 'web-app',
- *   apiKey: 'flg_xxx',
+ *   apiKey: 'fgr_xxx',
  *   plugins: [
  *     otelPlugin()                    // Uses global OTEL providers
  *     otelPlugin({ serviceName: 'my-app' })  // Custom service name

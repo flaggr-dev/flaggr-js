@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FlaggrClient } from "./client";
-import type { FlaggrPlugin, RequestInfo } from "./types";
+import type { EvaluationResult, FlaggrClientInstance, FlaggrPlugin, RequestInfo } from "./types";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -9,27 +9,83 @@ afterEach(() => {
 });
 
 describe("FlaggrClient", () => {
-  it("returns configured defaults without making a remote request", async () => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
+  describe("defaults: fallback values, not answers", () => {
+    it("evaluates a flag listed in defaults remotely in poll mode", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ value: false, reason: "TARGETING_MATCH", variant: "off" }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const plugin: FlaggrPlugin = { name: "observer", onEvaluateComplete: vi.fn() };
+      const client = new FlaggrClient({
+        apiUrl: "https://flaggr.test",
+        serviceId: "web",
+        defaults: { "new-nav": true },
+        plugins: [plugin],
+      });
 
-    const plugin: FlaggrPlugin = {
-      name: "observer",
-      onEvaluateComplete: vi.fn(),
-    };
-    const client = new FlaggrClient({
-      serviceId: "web",
-      defaults: { "new-nav": true },
-      plugins: [plugin],
+      await expect(client.getBooleanValue("new-nav", false)).resolves.toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0][0]).toBe("https://flaggr.test/api/flags/evaluate");
+      // The entry is the request's fallback (what the control plane answers
+      // NOT_FOUND with), not the caller's default.
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({ flagKey: "new-nav", defaultValue: true });
+      expect(plugin.onEvaluateComplete).toHaveBeenCalledWith(
+        "new-nav",
+        { value: false, reason: "TARGETING_MATCH", variant: "off" },
+        expect.any(Number),
+      );
+      client.destroy();
     });
 
-    await expect(client.getBooleanValue("new-nav", false)).resolves.toBe(true);
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(plugin.onEvaluateComplete).toHaveBeenCalledWith(
-      "new-nav",
-      { value: true, reason: "DEFAULT" },
-      expect.any(Number),
-    );
+    it("stands in for the caller's default when the evaluation fails or the flag isn't found", async () => {
+      const fetchMock = vi
+        .fn()
+        .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+        // services/flaggr-api: 200, FLAG_NOT_FOUND and no value.
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ reason: "FLAG_NOT_FOUND", errorCode: "FLAG_NOT_FOUND" }) });
+      vi.stubGlobal("fetch", fetchMock);
+      const plugin: FlaggrPlugin = { name: "errors", onEvaluateError: vi.fn() };
+      const client = new FlaggrClient({
+        apiUrl: "https://flaggr.test",
+        serviceId: "web",
+        defaults: { "new-nav": true, "rate-limit": 100 },
+        plugins: [plugin],
+      });
+
+      await expect(client.evaluate("new-nav", false)).resolves.toMatchObject({
+        value: true,
+        reason: "ERROR",
+        errorMessage: "Failed to fetch",
+      });
+      expect(plugin.onEvaluateError).toHaveBeenCalledTimes(1);
+      await expect(client.evaluate("rate-limit", 5)).resolves.toMatchObject({ value: 100, reason: "FLAG_NOT_FOUND" });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      client.destroy();
+    });
+
+    it("is what evaluateSync returns before anything has loaded", () => {
+      vi.stubGlobal("fetch", vi.fn());
+      const client = new FlaggrClient({ serviceId: "web", defaults: { "new-nav": true } });
+
+      expect(client.evaluateSync("new-nav", false)).toEqual({ value: true, reason: "DEFAULT" });
+      expect(client.getBooleanValueSync("new-nav", false)).toBe(true);
+      expect(client.evaluateSync("other", false)).toEqual({ value: false, reason: "DEFAULT" });
+      client.destroy();
+    });
+
+    it("stands in for the caller's default in a failed batch", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+      const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "web", defaults: { "new-nav": true } });
+
+      const results = await client.evaluateBatch([
+        { flagKey: "new-nav", defaultValue: false },
+        { flagKey: "other", defaultValue: "x" },
+      ]);
+      expect(results.get("new-nav")).toMatchObject({ value: true, reason: "ERROR" });
+      expect(results.get("other")).toMatchObject({ value: "x", reason: "ERROR" });
+      client.destroy();
+    });
   });
 
   it("posts authenticated evaluation requests and caches successful results", async () => {
@@ -816,6 +872,1096 @@ describe("batch evaluation against the data plane", () => {
     await vi.advanceTimersByTimeAsync(1000); // unchanged: no notification
 
     expect(changes).toEqual([true, false]);
+    client.destroy();
+  });
+});
+
+/** A 200 JSON response. */
+const jsonResponse = (body: unknown) =>
+  new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+
+const isOutcome = (url: unknown) => String(url).endsWith("/api/events/outcomes");
+
+describe("trackOutcome", () => {
+  /** The bodies of the outcome requests, parsed. */
+  const outcomeBodies = (fetchMock: { mock: { calls: unknown[][] } }) =>
+    fetchMock.mock.calls
+      .filter(([url]) => isOutcome(url))
+      .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>);
+
+  it("posts with the key as a bearer on a keepalive fetch, never navigator.sendBeacon", async () => {
+    // /api/events/outcomes refuses a request without Authorization (401), and
+    // Chromium refuses an application/json beacon: a beacon never arrived.
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) => jsonResponse({ accepted: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const sendBeacon = vi.fn(() => true);
+    vi.stubGlobal("navigator", { sendBeacon });
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      apiKey: "fgr_key",
+      serviceId: "web",
+      environment: "staging",
+    });
+
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase", eventValue: 49.99, userId: "u1" });
+
+    expect(sendBeacon).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://flaggr.test/api/events/outcomes");
+    expect(init).toMatchObject({
+      method: "POST",
+      keepalive: true,
+      headers: { "Content-Type": "application/json", Authorization: "Bearer fgr_key" },
+    });
+    expect(JSON.parse(String(init?.body))).toEqual({
+      flagKey: "checkout",
+      variant: "unknown",
+      eventName: "purchase",
+      eventValue: 49.99,
+      userId: "u1",
+      serviceId: "web",
+      environment: "staging",
+      projectId: "",
+    });
+    client.destroy();
+  });
+
+  it("sends the hosted data plane's outcomes to the Flaggr app, which stores them", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) => jsonResponse({ accepted: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiKey: "fgr_key", serviceId: "web" }); // apiUrl: https://api.flaggr.dev
+
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase" });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["https://flaggr.dev/api/events/outcomes"]);
+    client.destroy();
+  });
+
+  it("sends a body over the 64 KiB keepalive budget as a plain fetch", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) => jsonResponse({ accepted: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "web" });
+
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase", userId: "u".repeat(70 * 1024) });
+
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ keepalive: false, headers: { Authorization: "Bearer fgr_key" } });
+    client.destroy();
+  });
+
+  it("never throws", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Promise.reject(new TypeError("Failed to fetch"))));
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "web" });
+    await expect(client.trackOutcome({ flagKey: "checkout", eventName: "purchase" })).resolves.toBeUndefined();
+    client.destroy();
+  });
+
+  it("attributes each outcome to the variant evaluated for its own user, on a server evaluating for many", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      if (isOutcome(url)) return jsonResponse({ accepted: 1 });
+      const { context } = JSON.parse(String(init?.body)) as { context: { targetingKey?: string } };
+      const variant = context.targetingKey === "u1" ? "a" : "b";
+      return jsonResponse({ value: variant, variant, reason: "TARGETING_MATCH" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    // One client, a per-call context per request.
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "api" });
+    await client.getStringValue("checkout", "control", { targetingKey: "u1" });
+    await client.getStringValue("checkout", "control", { targetingKey: "u2" });
+
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase", userId: "u1" });
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase", targetingKey: "u2", userId: "customer-2" });
+    // Never evaluated for u3: not u2's variant.
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase", userId: "u3" });
+    // A caller that knows the variant says so.
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase", userId: "u3", variant: "c" });
+
+    expect(outcomeBodies(fetchMock).map((body) => [body.variant, body.userId])).toEqual([
+      ["a", "u1"],
+      ["b", "customer-2"],
+      ["unknown", "u3"],
+      ["c", "u3"],
+    ]);
+    // The targeting key only picks the variant: it isn't sent.
+    expect(outcomeBodies(fetchMock).every((body) => !("targetingKey" in body))).toBe(true);
+    client.destroy();
+  });
+
+  it("falls back to the client's own targetingKey in a browser", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, _init?: RequestInit) =>
+      isOutcome(url) ? jsonResponse({ accepted: 1 }) : jsonResponse({ value: true, variant: "on", reason: "TARGETING_MATCH" })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      apiKey: "fgr_key",
+      serviceId: "web",
+      context: { targetingKey: "visitor-1" },
+    });
+    await client.getBooleanValue("checkout", false);
+
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase" });
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase", userId: "customer-42" });
+    await client.trackOutcome({ flagKey: "checkout", eventName: "purchase", targetingKey: "someone-else" });
+
+    expect(outcomeBodies(fetchMock).map((body) => body.variant)).toEqual(["on", "on", "unknown"]);
+    client.destroy();
+  });
+
+  it("remembers at most 10,000 flag and targeting key pairs, dropping the least recently evaluated", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) => jsonResponse({ accepted: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      apiKey: "fgr_key",
+      serviceId: "api",
+      // Every read evaluates (locally) again, so each one counts as recent.
+      cacheTtl: -1,
+      bootstrap: { flags: [{ key: "checkout", type: "string", enabled: true, defaultValue: "control" }] },
+    });
+    const evaluateFor = (targetingKey: string) => client.getStringValue("checkout", "x", { targetingKey });
+    for (let i = 0; i < 10_000; i++) await evaluateFor(`u${i}`);
+    await evaluateFor("u0"); // the most recent again
+    await evaluateFor("u10000"); // one too many: u1 is dropped
+
+    for (const targetingKey of ["u0", "u1", "u2", "u10000"]) {
+      await client.trackOutcome({ flagKey: "checkout", eventName: "purchase", targetingKey });
+    }
+    expect(outcomeBodies(fetchMock).map((body) => body.variant)).toEqual(["control", "unknown", "control", "control"]);
+    client.destroy();
+  });
+});
+
+describe("keyless stream", () => {
+  interface FakeSource {
+    url: string;
+    readyState: number;
+    onopen: null | (() => void);
+    onmessage: null | ((e: MessageEvent) => void);
+    onerror: null | (() => void);
+    addEventListener: (...args: unknown[]) => void;
+    close: () => void;
+  }
+  /** EventSource, as browsers have it: readyState CLOSED (2) once refused or closed. */
+  const eventSources = () => {
+    const sources: FakeSource[] = [];
+    vi.stubGlobal(
+      "EventSource",
+      vi.fn(function (url: string) {
+        const source: FakeSource = {
+          url,
+          readyState: 0,
+          onopen: null,
+          onmessage: null,
+          onerror: null,
+          addEventListener: vi.fn(),
+          close: vi.fn(() => {
+            source.readyState = 2;
+          }),
+        };
+        sources.push(source);
+        return source;
+      })
+    );
+    return sources;
+  };
+  /** A control-plane batch answer: hero is on. */
+  const batchFetch = () =>
+    vi.fn(async (_url: string | URL, _init?: RequestInit) =>
+      jsonResponse({ flags: [{ key: "hero", value: true, reason: "STATIC" }], total: 1 })
+    );
+  const batchCalls = (fetchMock: ReturnType<typeof batchFetch>) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/api/flags/evaluate/batch")).length;
+
+  it("polls once EventSource is refused for good (the data plane's 401 to a request without a key)", async () => {
+    vi.useFakeTimers();
+    const fetchMock = batchFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const sources = eventSources();
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      serviceId: "demo",
+      updateMode: "stream",
+      batchIntervalMs: 1000,
+    });
+    const states: string[] = [];
+    client.onConnectionStateChange((state) => states.push(state));
+    const changes: unknown[] = [];
+    client.onFlagChange("hero", (event) => changes.push(event.newValue));
+
+    // A refusal: EventSource fires error with readyState CLOSED and won't reconnect.
+    sources[0].readyState = 2;
+    sources[0].onerror?.();
+    expect(states).toEqual(["error"]);
+    await vi.advanceTimersByTimeAsync(0); // the fallback's first refresh
+    expect(batchCalls(fetchMock)).toBe(1);
+    expect(changes).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(batchCalls(fetchMock)).toBe(2);
+
+    client.destroy();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(batchCalls(fetchMock)).toBe(2);
+    expect(sources).toHaveLength(1);
+  });
+
+  it("leaves a dropped connection to EventSource's own reconnect", async () => {
+    vi.useFakeTimers();
+    const fetchMock = batchFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const sources = eventSources();
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "demo", updateMode: "stream" });
+    client.onFlagChange("hero", () => {});
+
+    sources[0].readyState = 0; // CONNECTING: it retries by itself
+    sources[0].onerror?.();
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(client.getConnectionState()).toBe("error");
+    expect(batchCalls(fetchMock)).toBe(0);
+    expect(sources[0].close).not.toHaveBeenCalled();
+    client.destroy();
+  });
+
+  it("polls in a runtime without EventSource", async () => {
+    vi.useFakeTimers();
+    const fetchMock = batchFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("EventSource", undefined);
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      serviceId: "demo",
+      updateMode: "stream",
+      batchIntervalMs: 1000,
+    });
+    const changes: unknown[] = [];
+    client.onFlagChange("hero", (event) => changes.push(event.newValue));
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(batchCalls(fetchMock)).toBe(1);
+    expect(changes).toEqual([true]);
+    client.destroy();
+  });
+});
+
+describe("refresh()", () => {
+  /** Control plane: a value for each flag, from `values`; a batch answer lists them. */
+  const controlPlane = (values: Record<string, unknown>) =>
+    vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { flagKey?: string; flags?: Array<{ key: string }> };
+      if (String(url).endsWith("/batch")) {
+        return jsonResponse({ flags: body.flags!.map(({ key }) => ({ key, value: values[key], reason: "STATIC" })) });
+      }
+      return jsonResponse({ value: values[body.flagKey!], reason: "STATIC" });
+    });
+
+  it("re-evaluates the flags the client evaluated, in one batch, and notifies listeners of changes", async () => {
+    const values: Record<string, unknown> = { promo: "spring", hero: true };
+    const fetchMock = controlPlane(values);
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "web" });
+    await expect(client.getStringValue("promo", "none")).resolves.toBe("spring");
+    await expect(client.getBooleanValue("hero", false)).resolves.toBe(true);
+    const changes: unknown[] = [];
+    client.onFlagChange("promo", (event) => changes.push([event.oldValue, event.newValue]));
+    client.onFlagChange("hero", (event) => changes.push([event.oldValue, event.newValue]));
+
+    values.promo = "summer";
+    await client.refresh();
+
+    expect(changes).toEqual([["spring", "summer"]]);
+    expect(fetchMock).toHaveBeenCalledTimes(3); // two evaluations, one batch
+    // The refreshed values are cached.
+    await expect(client.getStringValue("promo", "none")).resolves.toBe("summer");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await client.refresh(); // nothing changed: nobody notified
+    expect(changes).toHaveLength(1);
+    client.destroy();
+  });
+
+  it("batch mode: a refresh that fails or can't find the flag neither caches nor announces its fallback", async () => {
+    vi.useFakeTimers();
+    let answer: "spring" | "offline" | "gone" = "spring";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
+        if (answer === "offline") throw new TypeError("Failed to fetch");
+        const body = JSON.parse(String(init?.body)) as { flagKey?: string; flagKeys?: string[] };
+        // services/flaggr-api: 200, FLAG_NOT_FOUND and a null value for a flag it doesn't have.
+        const result = (flagKey: string) =>
+          answer === "gone"
+            ? { flagKey, value: null, reason: "FLAG_NOT_FOUND", errorCode: "FLAG_NOT_FOUND" }
+            : { flagKey, value: "spring", reason: "STATIC" };
+        if (String(url).endsWith("/batch")) {
+          return jsonResponse({ flags: Object.fromEntries(body.flagKeys!.map((key) => [key, result(key)])) });
+        }
+        return jsonResponse(result(body.flagKey!));
+      })
+    );
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      serviceId: "web",
+      updateMode: "batch",
+      batchIntervalMs: 1000,
+    });
+    await expect(client.getStringValue("promo", "none")).resolves.toBe("spring");
+    const changes: unknown[] = [];
+    client.onFlagChange("promo", (event) => changes.push(event.newValue));
+
+    answer = "offline";
+    await vi.advanceTimersByTimeAsync(1000);
+    answer = "gone";
+    await vi.advanceTimersByTimeAsync(1000);
+
+    // The refreshes only had their own fallback (`false`) for promo: not a value.
+    expect(changes).toEqual([]);
+    // Nothing of it was cached: the read asks again, with its own default.
+    await expect(client.getStringValue("promo", "none")).resolves.toBe("none");
+    client.destroy();
+  });
+});
+
+describe("start: false and the client lifecycle", () => {
+  it("creates a client with no side effects until start()", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) => jsonResponse({}));
+    vi.stubGlobal("fetch", fetchMock);
+    const plugin: FlaggrPlugin = { name: "probe", onInit: vi.fn(), onDestroy: vi.fn() };
+    const client = new FlaggrClient(
+      {
+        apiUrl: "https://flaggr.test",
+        serviceId: "web",
+        updateMode: "batch",
+        batchIntervalMs: 1000,
+        remoteConfig: true,
+        plugins: [plugin],
+      },
+      { start: false }
+    );
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(plugin.onInit).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(client.getConnectionState()).toBe("disconnected");
+
+    client.start();
+    client.start(); // once only
+    expect(plugin.onInit).toHaveBeenCalledTimes(1);
+    expect(plugin.onInit).toHaveBeenCalledWith(client);
+    expect(fetchMock.mock.calls.map(([url]) => String(url).split("?")[0])).toEqual([
+      "https://flaggr.test/api/sdk-config",
+    ]);
+    expect(vi.getTimerCount()).toBe(1); // the batch timer
+    expect(client.getConnectionState()).toBe("connected");
+
+    client.destroy();
+    expect(plugin.onDestroy).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a client destroyed before start() never calls its plugins, and its waiting evaluations go ahead", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) => jsonResponse({ value: true, reason: "STATIC" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const plugin: FlaggrPlugin = { name: "probe", onInit: vi.fn(), onDestroy: vi.fn() };
+    const client = new FlaggrClient(
+      { apiUrl: "https://flaggr.test", serviceId: "web", remoteConfig: true, plugins: [plugin] },
+      { start: false }
+    );
+
+    const pending = client.getBooleanValue("hero", false); // waits for the remote config
+    client.destroy();
+    await expect(pending).resolves.toBe(true);
+    client.start(); // after destroy(): nothing
+    expect(plugin.onInit).not.toHaveBeenCalled();
+    expect(plugin.onDestroy).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual(["https://flaggr.test/api/flags/evaluate"]);
+  });
+
+  it("starts nothing when the remote config arrives after destroy()", async () => {
+    vi.useFakeTimers();
+    let answer!: (response: Response) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string | URL) =>
+        String(url).includes("/api/sdk-config")
+          ? new Promise<Response>((resolve) => (answer = resolve))
+          : Promise.resolve(jsonResponse({ flags: [] }))
+      )
+    );
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "web", remoteConfig: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    client.destroy();
+    answer(jsonResponse({ sdk: { updateMode: "batch", telemetry: true } }));
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    // No batch timer, no telemetry plugin (its flush timer).
+    expect(vi.getTimerCount()).toBe(0);
+    expect(client.getUpdateMode()).toBe("poll");
+  });
+
+  it("destroy() runs once", () => {
+    const plugin: FlaggrPlugin = { name: "probe", onDestroy: vi.fn() };
+    const client = new FlaggrClient({ serviceId: "web", plugins: [plugin] });
+    client.destroy();
+    client.destroy();
+    expect(plugin.onDestroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists a bootstrap snapshot under the client's auth scope", () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => void store.set(key, String(value)),
+      removeItem: (key: string) => void store.delete(key),
+      key: (index: number) => [...store.keys()][index] ?? null,
+      get length() {
+        return store.size;
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {}))); // the remote config never answers
+    const client = new FlaggrClient({
+      serviceId: "web",
+      apiKey: "fgr_key",
+      remoteConfig: true,
+      bootstrap: { flags: [{ key: "hero", type: "boolean", enabled: true, defaultValue: true }] },
+    });
+
+    // The key's scope, which a later load (readFlagSnapshot) looks for.
+    expect([...store.keys()].filter((key) => key.startsWith("flaggr:flags:"))).toEqual([
+      expect.stringMatching(/^flaggr:flags:web:production:k[0-9a-f]+$/),
+    ]);
+    client.destroy();
+  });
+});
+
+describe("public types", () => {
+  it("getObjectValue takes an interface", async () => {
+    interface Banner {
+      text: string;
+      dismissible: boolean;
+    }
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ value: { text: "Sale", dismissible: false }, reason: "STATIC" })));
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "web" });
+    const fallback: Banner = { text: "Welcome", dismissible: true };
+
+    const banner: Banner = await client.getObjectValue<Banner>("banner", fallback);
+    const instance: FlaggrClientInstance = client;
+    const again: Banner = await instance.getObjectValue("banner", fallback);
+
+    expect([banner, again]).toEqual([
+      { text: "Sale", dismissible: false },
+      { text: "Sale", dismissible: false },
+    ]);
+    client.destroy();
+  });
+
+  it("EvaluationResult.reason has the reasons both planes answer with", () => {
+    // src/lib/evaluator.ts (control plane) and services/flaggr-api (data plane).
+    const reasons: Array<EvaluationResult["reason"]> = [
+      "FLAG_NOT_FOUND",
+      "EXPERIMENT",
+      "PREREQUISITE_FAILED",
+      "MUTUAL_EXCLUSION",
+    ];
+    expect(reasons).toHaveLength(4);
+  });
+});
+
+/** A 200 text/event-stream response whose body the test writes (the keyed stream). */
+function eventStream() {
+  const encoder = new TextEncoder();
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const response = new Response(
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    }),
+    { status: 200, headers: { "Content-Type": "text/event-stream" } }
+  );
+  return {
+    response,
+    sync: (flags: unknown[]) =>
+      controller.enqueue(
+        encoder.encode(`event: configuration_sync\ndata: ${JSON.stringify({ type: "configuration_sync", flags })}\n\n`)
+      ),
+    message: (data: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`)),
+  };
+}
+
+/** The variants of the outcome requests a fetch mock saw, in order. */
+const outcomeVariants = (fetchMock: { mock: { calls: unknown[][] } }) =>
+  fetchMock.mock.calls
+    .filter(([url]) => isOutcome(url))
+    .map(([, init]) => (JSON.parse(String((init as RequestInit).body)) as { variant: string }).variant);
+
+describe("trackOutcome attribution", () => {
+  it("never gives an outcome the variant of an anonymous per-call evaluation (a server's anonymous request)", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      if (isOutcome(url)) return jsonResponse({ accepted: 1 });
+      const { context } = JSON.parse(String(init?.body)) as { context: { targetingKey?: string } };
+      return context.targetingKey === "bob"
+        ? jsonResponse({ value: "B", variant: "B", reason: "TARGETING_MATCH" })
+        : jsonResponse({ value: "anon-variant", variant: "anon-variant", reason: "TARGETING_MATCH" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    // A server's client: no context of its own, a per-call one per request.
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "api" });
+    await expect(client.getStringValue("checkout", "control", { country: "AU" })).resolves.toBe("anon-variant");
+    await expect(client.getStringValue("checkout", "control", { targetingKey: "bob" })).resolves.toBe("B");
+
+    await client.trackOutcome({ flagKey: "checkout", eventName: "buy", userId: "carol" }); // never evaluated
+    await client.trackOutcome({ flagKey: "checkout", eventName: "buy" });
+    await client.trackOutcome({ flagKey: "checkout", eventName: "buy", userId: "bob" });
+
+    expect(outcomeVariants(fetchMock)).toEqual(["unknown", "unknown", "B"]);
+    client.destroy();
+  });
+
+  it("still attributes a keyless client's own-context evaluations, with or without a userId", async () => {
+    const fetchMock = vi.fn(async (url: string | URL) =>
+      isOutcome(url) ? jsonResponse({ accepted: 1 }) : jsonResponse({ value: true, variant: "on", reason: "STATIC" })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    // A browser page's client without a targetingKey: the same context for all it evaluates.
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "web" });
+    await client.getBooleanValue("checkout", false);
+    await client.getBooleanValue("checkout", false, {}); // an empty per-call context is the client's own
+
+    await client.trackOutcome({ flagKey: "checkout", eventName: "buy" });
+    await client.trackOutcome({ flagKey: "checkout", eventName: "buy", userId: "customer-42" });
+
+    expect(outcomeVariants(fetchMock)).toEqual(["on", "on"]);
+    client.destroy();
+  });
+
+  it("attributes the outcomes of users evaluated through evaluateBatch to their own variants", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      if (isOutcome(url)) return jsonResponse({ accepted: 1 });
+      const body = JSON.parse(String(init?.body)) as { context: { targetingKey?: string }; flagKeys: string[] };
+      const variant = body.context.targetingKey === "alice" ? "A" : "B";
+      return jsonResponse({
+        flags: Object.fromEntries(body.flagKeys.map((flagKey) => [flagKey, { flagKey, value: variant, variant, reason: "SPLIT" }])),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "api" });
+    await client.evaluateBatch([{ flagKey: "checkout", defaultValue: "control" }], { targetingKey: "alice" });
+    await client.evaluateBatch([{ flagKey: "checkout", defaultValue: "control" }], { targetingKey: "bob" });
+
+    await client.trackOutcome({ flagKey: "checkout", eventName: "buy", userId: "alice" });
+    await client.trackOutcome({ flagKey: "checkout", eventName: "buy", userId: "bob" });
+
+    expect(outcomeVariants(fetchMock)).toEqual(["A", "B"]);
+    client.destroy();
+  });
+
+  it("follows a live update: the variant a stream sync gives the client's own context", async () => {
+    const stream = eventStream();
+    const fetchMock = vi.fn(async (url: string | URL) =>
+      isOutcome(url) ? jsonResponse({ accepted: 1 }) : stream.response
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      apiKey: "fgr_key",
+      serviceId: "web",
+      updateMode: "stream",
+      context: { targetingKey: "v1" },
+    });
+    const copy = (value: string) => ({ key: "copy", type: "string", enabled: true, defaultValue: value });
+    const seen: unknown[] = [];
+    client.onFlagChange("copy", (event) => seen.push(event.newValue));
+    stream.sync([copy("old")]);
+    await vi.waitFor(() => expect(client.localFlagCount).toBe(1));
+    await expect(client.getStringValue("copy", "none")).resolves.toBe("old");
+
+    stream.sync([copy("new")]);
+    await vi.waitFor(() => expect(seen).toContain("new"));
+    await client.trackOutcome({ flagKey: "copy", eventName: "buy" });
+
+    expect(outcomeVariants(fetchMock)).toEqual(["new"]);
+    client.destroy();
+  });
+
+  it("follows a value pushed by the control plane's legacy stream message", async () => {
+    const stream = eventStream();
+    const fetchMock = vi.fn(async (url: string | URL) =>
+      isOutcome(url) ? jsonResponse({ accepted: 1 }) : stream.response
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      apiKey: "fgr_key",
+      serviceId: "web",
+      updateMode: "stream",
+      bootstrap: { flags: [{ key: "copy", type: "string", enabled: true, defaultValue: "old" }] },
+    });
+    await expect(client.getStringValue("copy", "none")).resolves.toBe("old");
+
+    const seen: unknown[] = [];
+    client.onFlagChange("copy", (event) => seen.push(event.newValue));
+    stream.message({ flagKey: "copy", value: "pushed", variant: "treatment", reason: "TARGETING_MATCH" });
+    await vi.waitFor(() => expect(seen).toEqual(["pushed"]));
+    await client.trackOutcome({ flagKey: "copy", eventName: "buy" });
+
+    expect(outcomeVariants(fetchMock)).toEqual(["treatment"]);
+    client.destroy();
+  });
+
+  it("follows setContext: the variant a watched flag now has for the new user", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ accepted: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      apiKey: "fgr_key",
+      serviceId: "web",
+      context: { targetingKey: "u1" },
+      bootstrap: {
+        flags: [
+          {
+            key: "plan",
+            type: "string",
+            enabled: true,
+            defaultValue: "basic",
+            overrides: [{ identifiers: ["u2"], value: "pro" }],
+          },
+        ],
+      },
+    });
+    const seen: unknown[] = [];
+    client.onFlagChange("plan", (event) => seen.push(event.newValue)); // a hook watching it
+    await expect(client.getStringValue("plan", "none")).resolves.toBe("basic");
+
+    client.setContext({ targetingKey: "u2" });
+    expect(seen).toEqual(["pro"]);
+    await client.trackOutcome({ flagKey: "plan", eventName: "upgrade" });
+
+    expect(outcomeVariants(fetchMock)).toEqual(["pro"]);
+    client.destroy();
+  });
+});
+
+describe("trackOutcome and live updates of flags the app only watches", () => {
+  it("doesn't give an outcome the variant a stream sync gives the client's own context, for a flag the app evaluated only per call", async () => {
+    const stream = eventStream();
+    const fetchMock = vi.fn(async (url: string | URL) =>
+      isOutcome(url) ? jsonResponse({ accepted: 1 }) : stream.response
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "web", updateMode: "stream" });
+    const copy = (fallback: string) => ({
+      key: "copy",
+      type: "string",
+      enabled: true,
+      defaultValue: fallback,
+      targeting: [{ id: "r1", conditions: [{ property: "plan", operator: "equals", value: "pro" }], value: "pro-copy" }],
+    });
+    stream.sync([copy("standard")]);
+    await vi.waitFor(() => expect(client.localFlagCount).toBe(1));
+    // A hook with a per-call context: it watches the flag and evaluates it for that context.
+    const heard: unknown[] = [];
+    client.onFlagChange("copy", (event) => heard.push(event.newValue));
+    await expect(client.getStringValue("copy", "none", { plan: "pro" })).resolves.toBe("pro-copy");
+
+    stream.sync([copy("standard-2")]); // the client's own context now gets standard-2
+    await vi.waitFor(() => expect(heard).toEqual(["standard-2"]));
+    await client.trackOutcome({ flagKey: "copy", eventName: "buy" });
+
+    // Not standard-2: nobody was shown that. The per-call evaluation had no targeting key.
+    expect(outcomeVariants(fetchMock)).toEqual(["unknown"]);
+    client.destroy();
+  });
+
+  it("doesn't give an outcome the variant a refresh gives the client's own context, for a flag the app evaluated only per call", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      if (isOutcome(url)) return jsonResponse({ accepted: 1 });
+      const body = JSON.parse(String(init?.body)) as { context?: { targetingKey?: string }; flags?: Array<{ key: string }> };
+      const value = body.context?.targetingKey === "admin-preview" ? "beta" : "stable";
+      if (String(url).endsWith("/batch")) return jsonResponse({ flags: body.flags!.map(({ key }) => ({ key, value, reason: "STATIC" })) });
+      return jsonResponse({ value, reason: "STATIC" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "web", context: { targetingKey: "me" } });
+    client.onFlagChange("layout", () => {});
+    await client.getStringValue("layout", "none", { targetingKey: "admin-preview" });
+
+    await client.refresh(); // evaluates layout for "me" (stable): the listener may be the client's own
+    await client.trackOutcome({ flagKey: "layout", eventName: "buy" });
+    await client.trackOutcome({ flagKey: "layout", eventName: "buy", targetingKey: "admin-preview" });
+
+    expect(outcomeVariants(fetchMock)).toEqual(["unknown", "beta"]);
+    client.destroy();
+  });
+});
+
+describe("live updates and what the app evaluated per call", () => {
+  it("doesn't give an outcome the client's own variant after setContext or a pushed value, for a flag evaluated only per call", async () => {
+    const stream = eventStream();
+    const fetchMock = vi.fn(async (url: string | URL) =>
+      isOutcome(url) ? jsonResponse({ accepted: 1 }) : stream.response
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      apiKey: "fgr_key",
+      serviceId: "web",
+      updateMode: "stream",
+      context: { targetingKey: "me" },
+      bootstrap: { flags: [{ key: "plan", type: "string", enabled: true, defaultValue: "basic", overrides: [{ identifiers: ["other"], value: "pro" }] }] },
+    });
+    const heard: unknown[] = [];
+    client.onFlagChange("plan", (event) => heard.push(event.newValue));
+    // Only evaluated for someone else.
+    await expect(client.getStringValue("plan", "none", { targetingKey: "other" })).resolves.toBe("pro");
+
+    client.setContext({ targetingKey: "me-2" });
+    stream.message({ flagKey: "plan", value: "pushed", variant: "pushed-variant" });
+    await vi.waitFor(() => expect(heard).toEqual(["basic", "pushed"]));
+    await client.trackOutcome({ flagKey: "plan", eventName: "upgrade" });
+
+    expect(outcomeVariants(fetchMock)).toEqual(["unknown"]);
+    client.destroy();
+  });
+
+  it("drops what's cached for per-call contexts when the stream pushes a flag's new value", async () => {
+    const stream = eventStream();
+    let copy = "old";
+    const fetchMock = vi.fn(async (url: string | URL) =>
+      String(url).includes("/api/flags/stream") ? stream.response : jsonResponse({ value: copy, reason: "STATIC" })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", apiKey: "fgr_key", serviceId: "web", updateMode: "stream" });
+    await expect(client.getStringValue("copy", "none", { targetingKey: "u1" })).resolves.toBe("old");
+    const heard: unknown[] = [];
+    client.onFlagChange("copy", (event) => heard.push(event.newValue));
+
+    copy = "new";
+    stream.message({ flagKey: "copy", value: "new", reason: "STATIC" });
+    await vi.waitFor(() => expect(heard).toEqual(["new"]));
+
+    // Not the stale per-call entry: evaluated again.
+    await expect(client.getStringValue("copy", "none", { targetingKey: "u1" })).resolves.toBe("new");
+    client.destroy();
+  });
+});
+
+describe("refresh() and per-call contexts", () => {
+  /** Answers `beta` to the targeting key admin-preview, else `stable`; a batch answer lists them. */
+  const preview = () =>
+    vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as {
+        flagKey?: string;
+        flags?: Array<{ key: string }>;
+        context?: { targetingKey?: string };
+      };
+      const value = body.context?.targetingKey === "admin-preview" ? "beta" : "stable";
+      if (String(url).endsWith("/batch")) {
+        return jsonResponse({ flags: body.flags!.map(({ key }) => ({ key, value, reason: "TARGETING_MATCH" })) });
+      }
+      return jsonResponse({ value, reason: "TARGETING_MATCH" });
+    });
+  const batches = (fetchMock: ReturnType<typeof preview>) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/batch")).length;
+
+  it("doesn't evaluate a flag cached only for a per-call context with the client's own: it drops the entry", async () => {
+    const fetchMock = preview();
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "web", context: { targetingKey: "me" } });
+    await expect(client.getStringValue("layout", "none", { targetingKey: "admin-preview" })).resolves.toBe("beta");
+
+    await client.refresh();
+    expect(batches(fetchMock)).toBe(0);
+    // The per-call entry is gone: the next read asks again.
+    await expect(client.getStringValue("layout", "none", { targetingKey: "admin-preview" })).resolves.toBe("beta");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    client.destroy();
+  });
+
+  it("compares with the client's own context's entry only: a per-call value is never a change event's oldValue", async () => {
+    const fetchMock = preview();
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "web", context: { targetingKey: "me" } });
+    await client.getStringValue("layout", "none", { targetingKey: "admin-preview" }); // beta, per call
+    const events: Array<[unknown, unknown]> = [];
+    client.onFlagChange("layout", (event) => events.push([event.oldValue, event.newValue]));
+
+    await client.refresh();
+    // Nothing was cached for the client's own context: nothing to compare with.
+    expect(events).toEqual([[undefined, "stable"]]);
+
+    // Now both are cached, the per-call one first: still compared with the own one.
+    await client.getStringValue("layout", "none", { targetingKey: "admin-preview" });
+    await client.refresh();
+    expect(events).toHaveLength(1);
+    client.destroy();
+  });
+});
+
+describe("plugins and start()", () => {
+  /** A plugin that records the hooks it hears, in order. */
+  const recorder = () => {
+    const calls: string[] = [];
+    const plugin: FlaggrPlugin = {
+      name: "recorder",
+      onInit: () => void calls.push("onInit"),
+      onEvaluate: (flagKey) => void calls.push(`onEvaluate:${flagKey}`),
+      onEvaluateComplete: (flagKey, result) => void calls.push(`onEvaluateComplete:${flagKey}:${String(result.value)}`),
+      onRequest: (info) => void calls.push(`onRequest:${info.url}`),
+      onDestroy: () => void calls.push("onDestroy"),
+    };
+    return { calls, plugin };
+  };
+
+  it("delivers what a client did before start() after its plugins' onInit, in order", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ value: true, reason: "STATIC" })));
+    const { calls, plugin } = recorder();
+    const client = new FlaggrClient(
+      {
+        apiUrl: "https://flaggr.test",
+        serviceId: "web",
+        plugins: [plugin],
+        bootstrap: { flags: [{ key: "hero", type: "boolean", enabled: true, defaultValue: true }] },
+      },
+      { start: false }
+    );
+    // FlaggrProvider: a hook evaluates while rendering, then in its effect, both before start().
+    client.evaluateSync("hero", false);
+    await client.evaluate("promo", false);
+    expect(calls).toEqual([]);
+
+    client.start();
+    expect(calls).toEqual([
+      "onInit",
+      "onEvaluateComplete:hero:true",
+      "onEvaluate:promo",
+      "onRequest:https://flaggr.test/api/flags/evaluate",
+      "onEvaluateComplete:promo:true",
+    ]);
+    client.evaluateSync("hero", false);
+    expect(calls.at(-1)).toBe("onEvaluateComplete:hero:true");
+    client.destroy();
+    expect(calls.at(-1)).toBe("onDestroy");
+  });
+
+  it("calls no hook of a plugin whose client is destroyed before start()", () => {
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({})));
+    const { calls, plugin } = recorder();
+    const client = new FlaggrClient({ serviceId: "web", plugins: [plugin] }, { start: false });
+    client.evaluateSync("hero", false);
+    client.destroy();
+    client.start();
+    expect(calls).toEqual([]);
+  });
+
+  it("opens no transport for setUpdateMode before start(): start() opens the mode's", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => jsonResponse({ flags: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "web" }, { start: false });
+    client.onFlagChange("hero", () => {});
+
+    client.setUpdateMode("batch");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    client.start();
+    expect(vi.getTimerCount()).toBe(1); // the batch timer
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // its first refresh
+    client.destroy();
+  });
+});
+
+describe("remote config intervals", () => {
+  const batchCalls = (fetchMock: { mock: { calls: unknown[][] } }) =>
+    fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/api/flags/evaluate/batch")).length;
+
+  it("runs the first batch timer at the remote batchIntervalMs that comes with the remote updateMode", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (url: string | URL, _init?: RequestInit) =>
+      String(url).includes("/api/sdk-config")
+        ? jsonResponse({ sdk: { updateMode: "batch", batchIntervalMs: 50 } })
+        : jsonResponse({ flags: [{ key: "hero", value: true, reason: "STATIC" }] })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "web", remoteConfig: true });
+    client.onFlagChange("hero", () => {});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.getUpdateMode()).toBe("batch");
+    const first = batchCalls(fetchMock); // the switch's catch-up refresh
+
+    await vi.advanceTimersByTimeAsync(200);
+    expect(batchCalls(fetchMock) - first).toBe(4);
+    client.destroy();
+  });
+
+  it("moves a running batch timer to a remote batchIntervalMs that comes alone", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (url: string | URL, _init?: RequestInit) =>
+      String(url).includes("/api/sdk-config")
+        ? jsonResponse({ sdk: { batchIntervalMs: 50 } })
+        : jsonResponse({ flags: [{ key: "hero", value: true, reason: "STATIC" }] })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "web", updateMode: "batch", remoteConfig: true });
+    client.onFlagChange("hero", () => {});
+    await vi.advanceTimersByTimeAsync(0);
+    const first = batchCalls(fetchMock);
+
+    await vi.advanceTimersByTimeAsync(200);
+    expect(batchCalls(fetchMock) - first).toBe(4);
+    client.destroy();
+  });
+});
+
+describe("the stream's polling fallback, refused", () => {
+  const isBatch = (url: unknown) => String(url).endsWith("/api/flags/evaluate/batch");
+
+  it("stops once a batch is refused: the keyless page against a data plane that wants a key", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) =>
+      new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const sources: Array<{ readyState: number; onerror: null | (() => void); close: () => void }> = [];
+    vi.stubGlobal(
+      "EventSource",
+      vi.fn(function () {
+        const source = { readyState: 0, onopen: null, onmessage: null, onerror: null, addEventListener: vi.fn(), close: vi.fn() };
+        sources.push(source);
+        return source;
+      })
+    );
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "demo", updateMode: "stream", batchIntervalMs: 500 });
+    client.onFlagChange("hero", () => {});
+
+    sources[0].readyState = 2; // refused
+    sources[0].onerror?.();
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(fetchMock.mock.calls.filter(([url]) => isBatch(url))).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(client.getConnectionState()).toBe("error");
+    client.destroy();
+  });
+
+  it.each([401, 403])("stops when the keyed stream's fallback batch answers %i", async (status) => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) =>
+      new Response(JSON.stringify({ error: "refused" }), { status })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      apiKey: "fgr_revoked",
+      serviceId: "web",
+      updateMode: "stream",
+      batchIntervalMs: 500,
+    });
+    client.onFlagChange("hero", () => {});
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(fetchMock.mock.calls.filter(([url]) => isBatch(url))).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+    client.destroy();
+  });
+
+  it("keeps polling through a server error", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (url: string | URL, _init?: RequestInit) =>
+      String(url).includes("/api/flags/stream")
+        ? new Response("", { status: 401 })
+        : new Response(JSON.stringify({ error: "boom" }), { status: 503 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({
+      apiUrl: "https://flaggr.test",
+      apiKey: "fgr_key",
+      serviceId: "web",
+      updateMode: "stream",
+      batchIntervalMs: 500,
+    });
+    client.onFlagChange("hero", () => {});
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(fetchMock.mock.calls.filter(([url]) => isBatch(url)).length).toBeGreaterThanOrEqual(4);
+    client.destroy();
+  });
+
+  it("leaves batch mode, which the app chose, polling through a refused batch (as 0.4.0 did)", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (_url: string | URL, _init?: RequestInit) =>
+      new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "web", updateMode: "batch", batchIntervalMs: 500 });
+    client.onFlagChange("hero", () => {});
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(fetchMock.mock.calls.filter(([url]) => isBatch(url)).length).toBeGreaterThanOrEqual(4);
+    client.destroy();
+  });
+
+  it("ignores an error from an EventSource it has already replaced", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => jsonResponse({ flags: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+    const sources: Array<{ readyState: number; onerror: null | (() => void); close: () => void }> = [];
+    vi.stubGlobal(
+      "EventSource",
+      vi.fn(function () {
+        const source = { readyState: 0, onopen: null, onmessage: null, onerror: null, addEventListener: vi.fn(), close: vi.fn() };
+        sources.push(source);
+        return source;
+      })
+    );
+    const client = new FlaggrClient({ apiUrl: "https://flaggr.test", serviceId: "demo", updateMode: "stream", batchIntervalMs: 500 });
+    client.onFlagChange("hero", () => {});
+    client.setUpdateMode("poll");
+
+    // The closed source's late error: not the client's stream any more.
+    sources[0].readyState = 2;
+    sources[0].onerror?.();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(client.getConnectionState()).not.toBe("error");
+    client.destroy();
+  });
+});
+
+describe("FlaggrClientInstance compatibility", () => {
+  it("takes a hand-written implementation of 0.4.0's members (clearPersistedConfig is optional)", async () => {
+    // Type-checked by typecheck.test.ts: 0.4.0's interface had no clearPersistedConfig.
+    const result = { value: false, reason: "STATIC" as const };
+    const instance: FlaggrClientInstance = {
+      getBooleanValue: async () => false,
+      getStringValue: async () => "",
+      getNumberValue: async () => 0,
+      getObjectValue: async <T extends object>(_flagKey: string, defaultValue: T) => defaultValue,
+      evaluate: async () => result as never,
+      evaluateSync: () => result as never,
+      getBooleanValueSync: () => false,
+      setContext: () => {},
+      setUpdateMode: () => {},
+      getUpdateMode: () => "poll",
+      onFlagChange: () => () => {},
+      onConnectionStateChange: () => () => {},
+      getConnectionState: () => "disconnected" as never,
+      getConfig: () => ({ serviceId: "web" }),
+      refresh: async () => {},
+      trackOutcome: async () => {},
+      destroy: () => {},
+    };
+    expect(instance.clearPersistedConfig).toBeUndefined();
+    // The class has it.
+    const client: FlaggrClientInstance = new FlaggrClient({ serviceId: "web" });
+    expect(typeof client.clearPersistedConfig).toBe("function");
+    client.clearPersistedConfig?.();
     client.destroy();
   });
 });
