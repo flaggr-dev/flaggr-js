@@ -29,6 +29,8 @@
  *           data-api-key="fgr_..." data-telemetry defer></script>
  */
 
+import { appBaseUrl } from "./app-url";
+import { fetchWithKeepalive, fitsKeepaliveBudget } from "./keepalive";
 import type {
   EvaluationResult,
   FlaggrClientInstance,
@@ -39,7 +41,7 @@ import type {
 export interface TelemetryOptions {
   /** ms between periodic flushes (default 30000) */
   flushIntervalMs?: number;
-  /** capture LCP/CLS/FCP/INP/TTFB via PerformanceObserver (default true) */
+  /** capture LCP, CLS, FCP, INP and TTFB via PerformanceObserver (default true) */
   vitals?: boolean;
   /** capture window errors correlated with active flag variants (default true) */
   errors?: boolean;
@@ -63,29 +65,18 @@ export interface TelemetryOptions {
 /** Why telemetry stopped, already reported by console.warn. */
 const warned = new Set<string>();
 
-/** The hosted data plane (the client's default apiUrl): evaluation only, no telemetry endpoint. */
-const HOSTED_DATA_PLANE_HOST = "api.flaggr.dev";
-/** The hosted Flaggr app, which serves POST /api/analytics/sdk-telemetry. */
-const HOSTED_APP_ORIGIN = "https://flaggr.dev";
+/** The Flaggr app's route (the hosted data plane has no telemetry endpoint). */
 const TELEMETRY_PATH = "/api/analytics/sdk-telemetry";
 
 /**
- * Where a client's batches go (TelemetryOptions.endpoint). An unset apiUrl
- * stands for the client's default, the hosted data plane: the hosted app's
- * endpoint. An empty one (or "/") is the page's own origin, where the client
- * evaluates too: the endpoint's path there.
+ * Where a client's batches go (TelemetryOptions.endpoint): the Flaggr app's
+ * endpoint for the client's apiUrl (appBaseUrl). An unset apiUrl stands for
+ * the client's default, the hosted data plane: the hosted app's endpoint. An
+ * empty one (or "/") is the page's own origin, where the client evaluates
+ * too: the endpoint's path there.
  */
 export function telemetryEndpoint(apiUrl: string | undefined, endpoint?: string): string {
-  if (endpoint) return endpoint;
-  if (apiUrl === undefined) return `${HOSTED_APP_ORIGIN}${TELEMETRY_PATH}`;
-  const base = apiUrl.replace(/\/+$/, "");
-  let host = "";
-  try {
-    host = new URL(base).hostname.toLowerCase();
-  } catch {
-    /* not an absolute URL: post next to it */
-  }
-  return `${host === HOSTED_DATA_PLANE_HOST ? HOSTED_APP_ORIGIN : base}${TELEMETRY_PATH}`;
+  return endpoint || `${appBaseUrl(apiUrl)}${TELEMETRY_PATH}`;
 }
 
 /** Whether fetch() honours `keepalive` (Request#keepalive: Chrome 66, Safari 13, Firefox 133). */
@@ -103,12 +94,16 @@ function keepaliveFetchSupported(): boolean {
  * navigator.sendBeacon may send as "null" under a strict referrer policy
  * (Firefox, WebKit), and the endpoint trusts a batch for rollout RUM checks
  * only from a domain of the project's Sites. navigator.sendBeacon only where
- * keepalive fetch isn't supported. Returns false when neither went out.
+ * keepalive fetch isn't supported. Returns false when neither went out, and
+ * for a batch over what's left of the page's 64 KiB keepalive budget, which
+ * a beacon (held to the same quota) couldn't carry either: the caller sends
+ * that one as a plain request, which arrives unless the page is unloading.
  */
 function sendOnPageHide(url: string, body: string, onResponse: (response: Response) => void): boolean {
+  if (!fitsKeepaliveBudget(body)) return false;
   if (keepaliveFetchSupported()) {
     try {
-      fetch(url, { method: "POST", keepalive: true, headers: { "Content-Type": "text/plain" }, body })
+      fetchWithKeepalive(url, { method: "POST", headers: { "Content-Type": "text/plain" }, body })
         .then(onResponse)
         .catch(() => {});
       return true;
@@ -161,6 +156,8 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
   let vitalsObserver: PerformanceObserver | null = null;
   let onError: ((e: ErrorEvent) => void) | null = null;
   let onHide: (() => void) | null = null;
+  /** The document's visibilitychange listener: kept so onDestroy can remove it. */
+  let onVisibilityChange: (() => void) | null = null;
   /** No apiKey, or the endpoint refused it (401/403): no more telemetry from this client. */
   let refused = false;
   const requests: { durationMs: number; ok: boolean }[] = [];
@@ -279,11 +276,13 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
     if (pageHide && beacon && inBrowser && sendOnPageHide(url, JSON.stringify({ ...batch, apiKey }), answered)) {
       return;
     }
-    fetch(url, {
+    // Keepalive when the batch fits the page's 64 KiB keepalive budget: a
+    // bigger one (many flags, each vital sample tagged with all of them)
+    // would fail as a network error. It goes as a plain request instead.
+    fetchWithKeepalive(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(batch),
-      keepalive: true,
     })
       .then(answered)
       .catch(() => {});
@@ -316,13 +315,17 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
         try {
           vitalsObserver = new PerformanceObserver((list) => {
             for (const entry of list.getEntries()) {
+              // FCP is a "paint" entry named first-contentful-paint (the
+              // other paint entry, first-paint, isn't a Web Vital).
               const metric =
                 entry.entryType === "largest-contentful-paint"
                   ? "lcp"
                   : entry.entryType === "layout-shift"
                     ? "cls"
-                    : entry.entryType === "first-contentful-paint"
-                      ? "fcp"
+                    : entry.entryType === "paint"
+                      ? entry.name === "first-contentful-paint"
+                        ? "fcp"
+                        : null
                       : entry.entryType === "event"
                         ? "inp"
                         : entry.entryType === "navigation"
@@ -342,7 +345,7 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
               }
             }
           });
-          for (const type of ["largest-contentful-paint", "layout-shift", "first-contentful-paint", "event", "navigation"]) {
+          for (const type of ["largest-contentful-paint", "layout-shift", "paint", "event", "navigation"]) {
             try {
               vitalsObserver.observe({ type, buffered: true } as PerformanceObserverInit);
             } catch {
@@ -363,9 +366,10 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
       }
 
       onHide = () => flush(true);
-      document.addEventListener("visibilitychange", () => {
+      onVisibilityChange = () => {
         if (document.visibilityState === "hidden") onHide?.();
-      });
+      };
+      document.addEventListener("visibilitychange", onVisibilityChange);
       window.addEventListener("pagehide", onHide);
     },
 
@@ -389,9 +393,13 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
 
     onDestroy() {
       if (timer) clearInterval(timer);
+      timer = null;
       vitalsObserver?.disconnect();
+      vitalsObserver = null;
       if (onError) window.removeEventListener("error", onError);
       if (onHide) window.removeEventListener("pagehide", onHide);
+      if (onVisibilityChange) document.removeEventListener("visibilitychange", onVisibilityChange);
+      onError = onHide = onVisibilityChange = null;
       flush(true);
     },
   };

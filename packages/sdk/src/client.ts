@@ -16,8 +16,46 @@ import {
   isLocallyEvaluable,
 } from "@flaggr/evaluator";
 import type { FlagConfig } from "@flaggr/evaluator";
+import { appBaseUrl } from "./app-url";
 import { openEventStream } from "./event-stream";
 import { exposeFlag, forgetFlags, shouldExpose, withdrawFlag } from "./expose-flags";
+import { postWithKeepalive } from "./keepalive";
+
+/**
+ * The most (flag, targetingKey) variants a client keeps for trackOutcome. A
+ * server evaluating flags for many users would otherwise grow the map without
+ * bound; past this, the least recently evaluated pair is dropped.
+ */
+const MAX_TRACKED_VARIANTS = 10_000;
+
+/** lastEvaluatedVariants key: a flag and the targeting key it was evaluated for ("" for none). */
+function variantKey(flagKey: string, targetingKey: unknown): string {
+  return `${flagKey}\u0000${targetingKey === undefined || targetingKey === null ? "" : String(targetingKey)}`;
+}
+
+/** Whether a per-call context sets anything: `{}` evaluates as the client's own context. */
+function hasKeys(context: EvaluationContext | undefined): context is EvaluationContext {
+  if (!context) return false;
+  for (const key in context) {
+    if (Object.prototype.hasOwnProperty.call(context, key)) return true;
+  }
+  return false;
+}
+
+/** The plugin hooks the client calls as it evaluates, requests and updates (not onInit, onDestroy). */
+type PluginEvent =
+  | "onEvaluate"
+  | "onEvaluateComplete"
+  | "onEvaluateError"
+  | "onFlagChange"
+  | "onConnectionStateChange"
+  | "onRequest";
+
+/**
+ * The most plugin hook calls a client created with `{ start: false }` holds
+ * for start() (see callPlugins); past this, later ones are dropped.
+ */
+const MAX_PENDING_PLUGIN_CALLS = 1_000;
 
 interface CacheEntry {
   value: FlagValue;
@@ -91,14 +129,39 @@ export class FlaggrClient implements FlaggrClientInstance {
    */
   private stream: { close(): void } | null = null;
   private destroyed = false;
+  /** start() has run: plugins initialised, remote config and update delivery begun. */
+  private started = false;
+  /** The config as the caller gave it: its fields win over remote config. */
+  private explicitConfig: FlaggrConfig;
   /** Settles when remote SDK config has been applied (or skipped/failed) */
   private configReady: Promise<void>;
+  /** Settles configReady of a client created with `{ start: false }` once start() (or destroy()) runs. */
+  private releaseConfigReady?: () => void;
   private updateMode: UpdateMode;
   /** Auth scope for the persisted flag snapshot — "anon" or key hash. */
   private persistScope: string;
+  /** Refreshes watched flags every batchIntervalMs: batch mode's, or the stream's polling fallback. */
   private batchTimer: ReturnType<typeof setInterval> | null = null;
-  /** Tracks the last evaluated variant per flag key for outcome event correlation */
+  /** batchTimer is the stream's polling fallback (startPollingFallback), not batch mode's. */
+  private pollingFallback = false;
+  /**
+   * Plugin hook calls made before start(), delivered once start() has called
+   * the plugins' onInit (see callPlugins).
+   */
+  private pendingPluginCalls: Array<[PluginEvent, unknown[]]> = [];
+  /**
+   * The last evaluated variant per flag and targeting key (variantKey), for
+   * outcome event correlation; at most MAX_TRACKED_VARIANTS, oldest first.
+   */
   private lastEvaluatedVariants: Map<string, string> = new Map();
+  /**
+   * Flags the app evaluated with the client's own context (no per-call
+   * context). A live update of such a flag (stream sync, batch refresh,
+   * setContext, a pushed value) changes what the app shows, so its variant is
+   * tracked for trackOutcome. Not a flag only watched, say by a hook with a
+   * per-call context: its value for the client's own context is nobody's.
+   */
+  private ownEvaluated = new Set<string>();
   /** Publish resolved values to the page for browser analytics (`exposeFlags`). */
   private exposeFlags: boolean;
   /**
@@ -111,17 +174,30 @@ export class FlaggrClient implements FlaggrClientInstance {
   /** Bumped by setContext: results that arrive later belong to the old context. */
   private contextVersion = 0;
 
-  constructor(config: FlaggrConfig) {
+  /**
+   * @param options.start `false` creates the client without side effects:
+   * no plugin `onInit`, remote config fetch, stream or timer until
+   * `start()`. FlaggrProvider does this so a render React discards (Strict
+   * Mode renders twice; a server render never commits) leaves nothing
+   * running. Default: start now.
+   */
+  constructor(config: FlaggrConfig, options: { start?: boolean } = {}) {
     this.config = {
       apiUrl: "https://api.flaggr.dev",
       cacheTtl: 10_000,
       enableStreaming: false,
       ...config,
     };
+    this.explicitConfig = config;
     this.exposeFlags = shouldExpose(config.exposeFlags);
     this.plugins = config.plugins ?? [];
     this.context = config.context ?? {};
     this.hasBaseContext = Object.keys(this.context).length > 0;
+    // Auth scope of the persisted flag snapshot: set before the bootstrap
+    // below, which persists one when remoteConfig is on.
+    this.persistScope = this.config.apiKey
+      ? `k${fnv32(this.config.apiKey)}`
+      : "anon";
 
     // Seed from a bootstrap configuration so first paint never hits network
     if (config.bootstrap) {
@@ -131,20 +207,49 @@ export class FlaggrClient implements FlaggrClientInstance {
     this.updateMode =
       config.updateMode ?? (config.enableStreaming ? "stream" : "poll");
 
+    if (options.start === false) {
+      // A remote evaluation waits for start(), which fetches the remote config.
+      this.configReady = this.config.remoteConfig
+        ? new Promise<void>((resolve) => (this.releaseConfigReady = resolve))
+        : Promise.resolve();
+      return;
+    }
+    this.configReady = Promise.resolve();
+    this.start();
+  }
+
+  /**
+   * Start a client created with `{ start: false }`: initialise its plugins,
+   * fetch the remote config (`remoteConfig`) and open its update delivery
+   * (the stream, or the batch timer). Runs once; does nothing after
+   * destroy(). A client created without that option starts in its
+   * constructor.
+   */
+  start(): void {
+    if (this.started || this.destroyed) return;
+    this.started = true;
+
     // Notify plugins of initialization
     for (const plugin of this.plugins) {
       plugin.onInit?.(this);
     }
+    // Then what the client did before start(): FlaggrProvider's children
+    // evaluate while rendering and in their effects, which run before the
+    // provider's effect starts its client. A plugin hears nothing before its
+    // onInit, as with a client that starts in its constructor.
+    const pending = this.pendingPluginCalls;
+    this.pendingPluginCalls = [];
+    for (const [hook, args] of pending) this.deliverPluginCall(hook, args);
 
     // Remote config fetch — fills unset fields from GET /api/sdk-config
     // before the first remote eval; localStorage SWR keeps repeat loads free.
-    this.persistScope = this.config.apiKey
-      ? `k${fnv32(this.config.apiKey)}`
-      : "anon";
-
-    this.configReady = this.config.remoteConfig
-      ? this.loadRemoteConfig(config)
-      : Promise.resolve();
+    if (this.config.remoteConfig) {
+      const loaded = this.loadRemoteConfig(this.explicitConfig);
+      this.configReady = loaded;
+      const release = this.releaseConfigReady;
+      this.releaseConfigReady = undefined;
+      if (release) loaded.then(release, release);
+    }
 
     this.applyUpdateMode(this.updateMode);
 
@@ -168,6 +273,10 @@ export class FlaggrClient implements FlaggrClientInstance {
       bootstrapVersion?: string;
       sdk?: { updateMode?: UpdateMode; telemetry?: boolean; cacheTtlMs?: number; batchIntervalMs?: number };
     }) => {
+      // Destroyed while the config was on its way (FlaggrProvider under
+      // React Strict Mode destroys its first client at once): starting a
+      // transport or a plugin now would leave it running for good.
+      if (this.destroyed) return;
       // Bootstrap flag configs → local eval with zero extra round trips.
       // Skip the re-apply entirely when the persisted snapshot already
       // carries this exact content version.
@@ -185,21 +294,33 @@ export class FlaggrClient implements FlaggrClientInstance {
       }
       const sdk = cfg.sdk;
       if (!sdk) return;
-      if (explicit.updateMode === undefined && sdk.updateMode) {
-        this.updateMode = sdk.updateMode;
-        this.applyUpdateMode(sdk.updateMode);
-      }
       if (explicit.cacheTtl === undefined && sdk.cacheTtlMs) {
         this.config.cacheTtl = sdk.cacheTtlMs;
       }
-      if (explicit.batchIntervalMs === undefined && sdk.batchIntervalMs) {
+      // Before the update mode below: its batch timer runs at this interval.
+      let newInterval = false;
+      if (
+        explicit.batchIntervalMs === undefined &&
+        sdk.batchIntervalMs &&
+        sdk.batchIntervalMs !== this.config.batchIntervalMs
+      ) {
         this.config.batchIntervalMs = sdk.batchIntervalMs;
+        newInterval = true;
+      }
+      if (explicit.updateMode === undefined && sdk.updateMode) {
+        this.updateMode = sdk.updateMode;
+        this.applyUpdateMode(sdk.updateMode);
+      } else if (newInterval && this.batchTimer) {
+        // Only the interval changed: the running timer (batch mode's, or
+        // the stream's polling fallback) takes it up.
+        this.scheduleBatchTimer();
       }
       // Remote telemetry opt-in — attach the plugin lazily if the service
       // config asks for it and the caller didn't already provide one.
       if (sdk.telemetry && !this.plugins.some((p) => p.name === "flaggr-telemetry")) {
         void import("./telemetry")
           .then(({ flaggrTelemetry }) => {
+            if (this.destroyed) return;
             const plugin = flaggrTelemetry();
             this.plugins.push(plugin);
             plugin.onInit?.(this);
@@ -241,7 +362,7 @@ export class FlaggrClient implements FlaggrClientInstance {
       const headers: Record<string, string> = {};
       if (this.config.apiKey) headers.Authorization = `Bearer ${this.config.apiKey}`;
       const res = await fetch(
-        `${this.config.apiUrl}/api/sdk-config?${params}`,
+        `${appBaseUrl(this.config.apiUrl)}/api/sdk-config?${params}`,
         { headers }
       );
       if (!res.ok) return;
@@ -392,7 +513,8 @@ export class FlaggrClient implements FlaggrClientInstance {
   setUpdateMode(mode: UpdateMode): void {
     if (this.destroyed || mode === this.updateMode) return;
     this.updateMode = mode;
-    this.applyUpdateMode(mode);
+    // Not started yet: start() opens this mode's transport.
+    if (this.started) this.applyUpdateMode(mode);
   }
 
   getUpdateMode(): UpdateMode {
@@ -407,53 +529,77 @@ export class FlaggrClient implements FlaggrClientInstance {
     // Tear down whichever transport was active.
     this.stream?.close();
     this.stream = null;
-    if (this.batchTimer) {
-      clearInterval(this.batchTimer);
-      this.batchTimer = null;
-    }
+    this.stopBatchTimer();
+    // A destroyed client opens nothing (remote config can name a mode after destroy()).
+    if (this.destroyed) return;
 
     if (mode === "stream") {
       this.connectSSE();
     } else if (mode === "batch") {
-      const interval = this.config.batchIntervalMs ?? 2000;
-      this.batchTimer = setInterval(() => {
-        void this.refreshWatchedFlags();
-      }, interval);
+      this.scheduleBatchTimer();
       // Catch up immediately on switch instead of waiting a full tick.
       void this.refreshWatchedFlags();
     }
   }
 
+  /** (Re)start batchTimer at the current batchIntervalMs (default 2000). */
+  private scheduleBatchTimer(): void {
+    if (this.batchTimer) clearInterval(this.batchTimer);
+    this.batchTimer = setInterval(() => {
+      void this.refreshWatchedFlags();
+    }, this.config.batchIntervalMs ?? 2000);
+  }
+
+  private stopBatchTimer(): void {
+    if (this.batchTimer) clearInterval(this.batchTimer);
+    this.batchTimer = null;
+    this.pollingFallback = false;
+  }
+
   /**
-   * Batch-mode refresh: one POST covers every flag the app actually uses —
-   * watched via listeners or already cached — instead of a request per flag.
-   * Watched cache entries are dropped first so the batch revalidates rather
-   * than short-circuiting on the TTL; listeners fire on observed changes.
+   * Batch-mode refresh (and refresh()): one POST covers every flag the app
+   * actually uses — watched via listeners or cached for the client's own
+   * context — instead of a request per flag, evaluated with the client's own
+   * context. Their cache entries are dropped first so the batch revalidates
+   * rather than short-circuiting on the TTL; listeners fire on observed
+   * changes. A result without a value of its own (ERROR: the request failed
+   * or the answer left the flag out; NOT_FOUND, FLAG_NOT_FOUND) is neither
+   * cached nor announced.
+   *
+   * Results cached for per-call contexts are dropped, and go to the network
+   * again at their next call. A flag cached only for per-call contexts, and
+   * not watched, isn't evaluated: its value for the client's own context is
+   * nobody's to announce or publish (as with setContext).
    */
   private async refreshWatchedFlags(): Promise<void> {
-    const keys = new Set<string>();
-    for (const flagKey of this.flagChangeListeners.keys()) keys.add(flagKey);
+    const keys = new Set<string>(this.flagChangeListeners.keys());
+    // What the listeners last heard: the entry for the client's own context,
+    // which the refresh evaluates with. Never a per-call context's value.
     const oldValues = new Map<string, FlagValue>();
     for (const [cacheKey, entry] of this.cache) {
-      const pipe = cacheKey.indexOf("|");
-      const base = pipe === -1 ? cacheKey : cacheKey.slice(0, pipe);
-      keys.add(base);
-      if (!oldValues.has(base)) oldValues.set(base, entry.value);
+      if (cacheKey.includes("|")) continue; // a per-call context's
+      keys.add(cacheKey);
+      oldValues.set(cacheKey, entry.value);
+    }
+    for (const cacheKey of [...this.cache.keys()]) {
+      if (cacheKey.includes("|") || keys.has(cacheKey)) this.cache.delete(cacheKey);
     }
     if (keys.size === 0) return;
-    for (const cacheKey of [...this.cache.keys()]) {
-      const pipe = cacheKey.indexOf("|");
-      const base = pipe === -1 ? cacheKey : cacheKey.slice(0, pipe);
-      if (keys.has(base)) this.cache.delete(cacheKey);
-    }
     const requests = [...keys].map((flagKey) => ({
       flagKey,
       defaultValue:
         (this.flagConfigs.get(flagKey)?.defaultValue as FlagValue | undefined) ??
         false,
     }));
-    const results = await this.evaluateBatch(requests);
+    const results = await this.evaluateMany(requests, undefined, true);
     for (const [flagKey, result] of results) {
+      if (result.reason === "ERROR" || /NOT_FOUND/.test(result.reason)) {
+        // No value of its own: only the default this refresh asked with (it
+        // doesn't know the callers'). Not served from the cache — the next
+        // evaluation asks again, with its own default — nor announced.
+        this.cache.delete(flagKey);
+        continue;
+      }
       const oldValue = oldValues.get(flagKey);
       if (oldValue !== undefined &&
           JSON.stringify(oldValue) === JSON.stringify(result.value)) {
@@ -469,9 +615,31 @@ export class FlaggrClient implements FlaggrClientInstance {
       for (const listener of listeners) {
         listener(changeEvent);
       }
-      for (const plugin of this.plugins) {
-        plugin.onFlagChange?.(changeEvent);
-      }
+      this.callPlugins("onFlagChange", changeEvent);
+    }
+  }
+
+  /**
+   * Call a plugin hook on every plugin. Before start() (a client created
+   * with `{ start: false }`), the call waits for start() to call the
+   * plugins' onInit, then comes in order with the others; a client
+   * destroyed before start() never calls its plugins.
+   */
+  private callPlugins<K extends PluginEvent>(
+    hook: K,
+    ...args: Parameters<NonNullable<FlaggrPlugin[K]>>
+  ): void {
+    if (this.plugins.length === 0) return;
+    if (this.started) {
+      this.deliverPluginCall(hook, args);
+    } else if (!this.destroyed && this.pendingPluginCalls.length < MAX_PENDING_PLUGIN_CALLS) {
+      this.pendingPluginCalls.push([hook, args]);
+    }
+  }
+
+  private deliverPluginCall(hook: PluginEvent, args: unknown[]): void {
+    for (const plugin of this.plugins) {
+      (plugin[hook] as ((...hookArgs: unknown[]) => void) | undefined)?.apply(plugin, args);
     }
   }
 
@@ -502,12 +670,12 @@ export class FlaggrClient implements FlaggrClientInstance {
     return result.value;
   }
 
-  async getObjectValue<T extends Record<string, unknown>>(
+  async getObjectValue<T extends object>(
     flagKey: string,
     defaultValue: T,
     context?: EvaluationContext
   ): Promise<T> {
-    const result = await this.evaluate<T>(
+    const result = await this.evaluate<T & FlagValue>(
       flagKey,
       defaultValue as T & FlagValue,
       context
@@ -530,15 +698,26 @@ export class FlaggrClient implements FlaggrClientInstance {
   }
 
   /**
+   * The value an evaluation falls back to: the flag's `defaults` entry when
+   * the config has one, else the caller's `defaultValue`.
+   */
+  private fallbackFor<T extends FlagValue>(flagKey: string, defaultValue: T): T {
+    const entry = this.config.defaults?.[flagKey];
+    return entry !== undefined ? (entry as T) : defaultValue;
+  }
+
+  /**
    * Synchronous evaluation — local-only fast path. Returns the streamed or
-   * cached value; falls back to `defaultValue` when neither is available
-   * (caller can then use the async API to fetch remotely).
+   * cached value; falls back to the flag's `defaults` entry, else
+   * `defaultValue`, when neither is available (caller can then use the
+   * async API to fetch remotely).
    */
   evaluateSync<T extends FlagValue>(
     flagKey: string,
     defaultValue: T,
     context?: EvaluationContext
   ): EvaluationResult<T> {
+    if (!hasKeys(context)) this.ownEvaluated.add(flagKey);
     const mergedContext = !context
       ? this.context
       : this.hasBaseContext
@@ -557,12 +736,11 @@ export class FlaggrClient implements FlaggrClientInstance {
             reason: cached.reason as EvaluationResult["reason"],
             variant: cached.variant,
           }
-        : { value: defaultValue, reason: "DEFAULT" };
-    // The defaultValue fallback (nothing resolved yet) is never published.
+        : { value: this.fallbackFor(flagKey, defaultValue), reason: "DEFAULT" };
+    // The fallback (nothing resolved yet) is never published.
     if (local || cached) this.expose(flagKey, result, context);
     if (timed) {
-      const d = performance.now() - start;
-      for (const p of plugins) p.onEvaluateComplete?.(flagKey, result, d);
+      this.callPlugins("onEvaluateComplete", flagKey, result, performance.now() - start);
     }
     return result;
   }
@@ -583,13 +761,11 @@ export class FlaggrClient implements FlaggrClientInstance {
           ? { ...this.context, ...context }
           : context);
     const start = performance.now();
+    if (!hasKeys(context)) this.ownEvaluated.add(flagKey);
 
     // Notify plugins: before evaluation
     if (this.plugins.length) {
-      const merged = mergeContext();
-      for (const plugin of this.plugins) {
-        plugin.onEvaluate?.(flagKey, merged);
-      }
+      this.callPlugins("onEvaluate", flagKey, mergeContext());
     }
 
     try {
@@ -603,9 +779,7 @@ export class FlaggrClient implements FlaggrClientInstance {
           variant: cached.variant,
         };
         this.expose(flagKey, result, context);
-        for (const plugin of this.plugins) {
-          plugin.onEvaluateComplete?.(flagKey, result, duration);
-        }
+        this.callPlugins("onEvaluateComplete", flagKey, result, duration);
         return result;
       }
 
@@ -614,36 +788,23 @@ export class FlaggrClient implements FlaggrClientInstance {
       const local = this.tryLocalEval<T>(flagKey, mergeContext());
       if (local) {
         this.setCache(flagKey, local, context);
-        this.trackVariant(flagKey, local);
+        this.trackVariant(flagKey, local, context);
         this.expose(flagKey, local, context);
         const duration = performance.now() - start;
-        for (const plugin of this.plugins) {
-          plugin.onEvaluateComplete?.(flagKey, local, duration);
-        }
+        this.callPlugins("onEvaluateComplete", flagKey, local, duration);
         return local;
-      }
-
-      // Check defaults
-      if (this.config.defaults?.[flagKey] !== undefined) {
-        const result: EvaluationResult<T> = {
-          value: this.config.defaults[flagKey] as T,
-          reason: "DEFAULT",
-        };
-        const duration = performance.now() - start;
-        for (const plugin of this.plugins) {
-          plugin.onEvaluateComplete?.(flagKey, result, duration);
-        }
-        return result;
       }
 
       // Remote evaluation — deduplicated so concurrent calls share one fetch.
       // Wait for remote config if it's mid-flight (bounded: fetch resolves or
-      // fails quickly; the local/cached paths above never touch this).
+      // fails quickly; the local/cached paths above never touch this). A
+      // `defaults` entry is only the fallback: the flag is evaluated all the
+      // same, and the entry stands in for defaultValue (not found, failure).
       const version = this.contextVersion;
       await this.configReady;
       const result = await this.remoteEvaluateDeduped<T>(
         flagKey,
-        defaultValue,
+        this.fallbackFor(flagKey, defaultValue),
         mergeContext()
       );
       const duration = performance.now() - start;
@@ -653,30 +814,27 @@ export class FlaggrClient implements FlaggrClientInstance {
       if (version === this.contextVersion) {
         this.setCache(flagKey, result, context);
         // Track variant for outcome correlation
-        this.trackVariant(flagKey, result);
+        this.trackVariant(flagKey, result, context);
         this.expose(flagKey, result, context);
       }
 
       // Notify plugins: after evaluation
-      for (const plugin of this.plugins) {
-        plugin.onEvaluateComplete?.(flagKey, result, duration);
-      }
+      this.callPlugins("onEvaluateComplete", flagKey, result, duration);
 
       return result;
     } catch (error) {
       const duration = performance.now() - start;
 
       // Notify plugins: error
-      for (const plugin of this.plugins) {
-        plugin.onEvaluateError?.(
-          flagKey,
-          error instanceof Error ? error : new Error(String(error)),
-          duration
-        );
-      }
+      this.callPlugins(
+        "onEvaluateError",
+        flagKey,
+        error instanceof Error ? error : new Error(String(error)),
+        duration
+      );
 
       return {
-        value: defaultValue,
+        value: this.fallbackFor(flagKey, defaultValue),
         reason: "ERROR",
         errorMessage: error instanceof Error ? error.message : String(error),
       };
@@ -692,6 +850,22 @@ export class FlaggrClient implements FlaggrClientInstance {
   async evaluateBatch(
     requests: Array<{ flagKey: string; defaultValue: FlagValue }>,
     context?: EvaluationContext
+  ): Promise<Map<string, EvaluationResult>> {
+    if (!hasKeys(context)) {
+      for (const { flagKey } of requests) this.ownEvaluated.add(flagKey);
+    }
+    return this.evaluateMany(requests, context, false);
+  }
+
+  /**
+   * evaluateBatch, and refreshWatchedFlags' batch (`refresh`): a refresh
+   * tracks the variants (trackVariant) only of the flags the app evaluated
+   * with the client's own context (ownEvaluated).
+   */
+  private async evaluateMany(
+    requests: Array<{ flagKey: string; defaultValue: FlagValue }>,
+    context: EvaluationContext | undefined,
+    refresh: boolean
   ): Promise<Map<string, EvaluationResult>> {
     // Lazy merge — skipped entirely when every flag hits cache.
     let mergedContext: EvaluationContext | undefined;
@@ -719,12 +893,13 @@ export class FlaggrClient implements FlaggrClientInstance {
       const local = this.tryLocalEval(flagKey, mergeContext());
       if (local) {
         this.setCache(flagKey, local, context);
-        this.trackVariant(flagKey, local);
+        if (!refresh || this.ownEvaluated.has(flagKey)) this.trackVariant(flagKey, local, context);
         this.expose(flagKey, local, context);
         results.set(flagKey, local);
         continue;
       }
-      remoteNeeded.push({ flagKey, defaultValue });
+      // A `defaults` entry stands in for defaultValue, as in evaluate().
+      remoteNeeded.push({ flagKey, defaultValue: this.fallbackFor(flagKey, defaultValue) });
     }
 
     await this.configReady;
@@ -737,7 +912,7 @@ export class FlaggrClient implements FlaggrClientInstance {
       chunks.push(remoteNeeded.slice(i, i + 100));
     }
     for (let i = 0; i < chunks.length; i += CHUNK_CONCURRENCY) {
-      await Promise.all(chunks.slice(i, i + CHUNK_CONCURRENCY).map((chunk) => this.fetchBatchChunk(chunk, mergeContext(), context, results, version)));
+      await Promise.all(chunks.slice(i, i + CHUNK_CONCURRENCY).map((chunk) => this.fetchBatchChunk(chunk, mergeContext(), context, results, version, refresh)));
     }
 
     return results;
@@ -749,7 +924,9 @@ export class FlaggrClient implements FlaggrClientInstance {
     context: EvaluationContext | undefined,
     results: Map<string, EvaluationResult>,
     /** contextVersion when the batch started (see evaluate's remote path). */
-    version: number
+    version: number,
+    /** refreshWatchedFlags' batch (see evaluateMany). */
+    refresh: boolean
   ): Promise<void> {
       try {
         const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -772,6 +949,7 @@ export class FlaggrClient implements FlaggrClientInstance {
           }),
         });
         if (!response.ok) {
+          if (response.status === 401 || response.status === 403) this.batchRefused();
           throw new Error(`Batch evaluation failed: HTTP ${response.status}`);
         }
         // The data plane answers with a map of flag key → result, the
@@ -791,7 +969,7 @@ export class FlaggrClient implements FlaggrClientInstance {
             : { value: defaultValue, reason: "ERROR", errorMessage: "Flag missing from batch response" };
           if (version === this.contextVersion) {
             this.setCache(flagKey, result, context);
-            this.trackVariant(flagKey, result);
+            if (!refresh || this.ownEvaluated.has(flagKey)) this.trackVariant(flagKey, result, context);
             this.expose(flagKey, result, context);
           }
           results.set(flagKey, result);
@@ -829,6 +1007,8 @@ export class FlaggrClient implements FlaggrClientInstance {
         !isLocallyEvaluable(flag)
       ) continue;
       const next = Evaluator.evaluate(flag, context);
+      // The value the app now shows for this flag: what an outcome goes to.
+      if (this.ownEvaluated.has(flagKey)) this.trackVariant(flagKey, next as EvaluationResult);
       this.expose(flagKey, next); // in use, so no `pushed` check needed
       // No previous value is tracked post-clear; notify with the new value.
       const changeEvent: FlagChangeEvent = { flagKey, newValue: next.value };
@@ -865,8 +1045,13 @@ export class FlaggrClient implements FlaggrClientInstance {
     return this.connectionState;
   }
 
+  /**
+   * Re-evaluate everything cached or watched, in one batch, and notify the
+   * listeners of what changed (see FlaggrClientInstance.refresh).
+   */
   async refresh(): Promise<void> {
-    this.cache.clear();
+    if (this.destroyed) return;
+    await this.refreshWatchedFlags();
   }
 
   /** Current configuration version reported by the stream, if connected. */
@@ -879,63 +1064,81 @@ export class FlaggrClient implements FlaggrClientInstance {
     return this.flagConfigs.size;
   }
 
+  /**
+   * POST the outcome to the Flaggr app's /api/events/outcomes, which stores
+   * outcomes (appBaseUrl: https://flaggr.dev when apiUrl is the hosted data
+   * plane), with the apiKey as a bearer: the route refuses a request without
+   * one (401). Never navigator.sendBeacon, which can't carry that header: a
+   * keepalive fetch, which outlives the page as a beacon does (a pagehide
+   * handler can track an outcome), when the body fits the page's 64 KiB
+   * keepalive budget (one event takes a few hundred bytes), else a plain
+   * fetch.
+   */
   async trackOutcome(event: OutcomeEvent): Promise<void> {
-    const variant =
-      this.lastEvaluatedVariants.get(event.flagKey) || "unknown";
-    const body = JSON.stringify({
-      flagKey: event.flagKey,
-      variant,
-      eventName: event.eventName,
-      eventValue: event.eventValue,
-      userId: event.userId,
-      serviceId: this.config.serviceId,
-      environment: this.config.environment || "production",
-      projectId: "",
-    });
-
     try {
-      // sendBeacon never blocks the page and survives unload
-      if (
-        typeof navigator !== "undefined" &&
-        typeof navigator.sendBeacon === "function"
-      ) {
-        const sent = navigator.sendBeacon(
-          `${this.config.apiUrl}/api/events/outcomes`,
-          new Blob([body], { type: "application/json" })
-        );
-        if (sent) return;
-      }
-
+      const body = JSON.stringify({
+        flagKey: event.flagKey,
+        variant: this.outcomeVariant(event),
+        eventName: event.eventName,
+        eventValue: event.eventValue,
+        userId: event.userId,
+        serviceId: this.config.serviceId,
+        environment: this.config.environment || "production",
+        projectId: "",
+      });
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
       };
       if (this.config.apiKey) {
         headers["Authorization"] = `Bearer ${this.config.apiKey}`;
       }
-      await fetch(`${this.config.apiUrl}/api/events/outcomes`, {
-        method: "POST",
-        headers,
-        body,
-        keepalive: true,
-      });
+      await postWithKeepalive(`${appBaseUrl(this.config.apiUrl)}/api/events/outcomes`, headers, body);
     } catch {
       // Outcome tracking is best-effort; never throw
     }
   }
 
+  /**
+   * The variant an outcome is attributed to: the event's own, else the one
+   * last evaluated for the flag and the event's targetingKey — by default its
+   * userId, then the client's own targetingKey (or, for a client without
+   * one, its own context: see trackVariant) — else "unknown". Never the
+   * variant evaluated for someone else.
+   */
+  private outcomeVariant(event: OutcomeEvent): string {
+    if (event.variant) return event.variant;
+    const keys: unknown[] =
+      event.targetingKey !== undefined
+        ? [event.targetingKey]
+        : event.userId !== undefined
+          ? [event.userId, this.context.targetingKey]
+          : [this.context.targetingKey];
+    for (const targetingKey of keys) {
+      const variant = this.lastEvaluatedVariants.get(variantKey(event.flagKey, targetingKey));
+      if (variant !== undefined) return variant;
+    }
+    return "unknown";
+  }
+
   destroy(): void {
+    if (this.destroyed) return;
     this.destroyed = true;
+    // Evaluations waiting for a start() that never came go ahead.
+    this.releaseConfigReady?.();
+    this.releaseConfigReady = undefined;
     this.stream?.close();
     this.stream = null;
-    if (this.batchTimer) {
-      clearInterval(this.batchTimer);
-      this.batchTimer = null;
-    }
+    this.stopBatchTimer();
     this.cache.clear();
     this.flagConfigs.clear();
     this.flagChangeListeners.clear();
     this.connectionListeners.clear();
+    this.ownEvaluated.clear();
 
+    // A client that never started never called its plugins' onInit, nor
+    // any other hook of theirs.
+    this.pendingPluginCalls = [];
+    if (!this.started) return;
     for (const plugin of this.plugins) {
       plugin.onDestroy?.();
     }
@@ -981,34 +1184,55 @@ export class FlaggrClient implements FlaggrClientInstance {
       const responseBytes = response.headers?.get
         ? Number(response.headers.get("content-length") ?? 0)
         : 0;
-      for (const plugin of this.plugins) {
-        plugin.onRequest?.({
-          url,
-          durationMs: Math.round(performance.now() - start),
-          ok: response.ok,
-          requestBytes,
-          responseBytes: Number.isFinite(responseBytes) ? responseBytes : 0,
-        });
-      }
+      this.callPlugins("onRequest", {
+        url,
+        durationMs: Math.round(performance.now() - start),
+        ok: response.ok,
+        requestBytes,
+        responseBytes: Number.isFinite(responseBytes) ? responseBytes : 0,
+      });
       return response;
     } catch (error) {
-      for (const plugin of this.plugins) {
-        plugin.onRequest?.({
-          url,
-          durationMs: Math.round(performance.now() - start),
-          ok: false,
-          requestBytes,
-          responseBytes: 0,
-        });
-      }
+      this.callPlugins("onRequest", {
+        url,
+        durationMs: Math.round(performance.now() - start),
+        ok: false,
+        requestBytes,
+        responseBytes: 0,
+      });
       throw error;
     }
   }
 
-  private trackVariant(flagKey: string, result: EvaluationResult): void {
+  /**
+   * Remember the variant an evaluation gave, for trackOutcome: per flag and
+   * targeting key, so a server evaluating for many users attributes each
+   * outcome to its own user's variant. `context` is the evaluation's per-call
+   * context, if it had one; the targeting key is the one it was evaluated
+   * with (the per-call context's, else the client's own).
+   *
+   * An evaluation without a targeting key is kept under "" only when it used
+   * the client's own context, which is the same for everything the client
+   * evaluates. One whose per-call context leaves it without a targeting key
+   * (say a server evaluating an anonymous request) isn't kept: it's no one's
+   * in particular, so an outcome falling back to the client's own context
+   * mustn't get it. The map keeps the MAX_TRACKED_VARIANTS most recently
+   * evaluated pairs.
+   */
+  private trackVariant(flagKey: string, result: EvaluationResult, context?: EvaluationContext): void {
+    const perCall = hasKeys(context);
+    const targetingKey =
+      perCall && "targetingKey" in context ? context.targetingKey : this.context.targetingKey;
+    if (perCall && (targetingKey === undefined || targetingKey === null || targetingKey === "")) return;
     const v = result.variant ?? String(result.value);
-    if (this.lastEvaluatedVariants.get(flagKey) !== v) {
-      this.lastEvaluatedVariants.set(flagKey, v);
+    const key = variantKey(flagKey, targetingKey);
+    const variants = this.lastEvaluatedVariants;
+    // Re-inserted, so the most recently evaluated pairs are the last dropped.
+    variants.delete(key);
+    variants.set(key, v);
+    if (variants.size > MAX_TRACKED_VARIANTS) {
+      const oldest = variants.keys().next().value;
+      if (oldest !== undefined) variants.delete(oldest);
     }
   }
 
@@ -1159,9 +1383,7 @@ export class FlaggrClient implements FlaggrClientInstance {
     for (const listener of this.connectionListeners) {
       listener(state);
     }
-    for (const plugin of this.plugins) {
-      plugin.onConnectionStateChange?.(state);
-    }
+    this.callPlugins("onConnectionStateChange", state);
   }
 
   /**
@@ -1246,21 +1468,21 @@ export class FlaggrClient implements FlaggrClientInstance {
     const hasListeners = this.flagChangeListeners.has(flagKey);
     const cached = this.cache.get(flagKey);
     if (!hasListeners && !cached) return;
-    if (!isLocallyEvaluable(flag)) {
-      // Remote-only flag: drop all cached values so next eval refetches.
-      this.deleteFlagCacheEntries(flagKey);
-      return;
-    }
+    // Config changed: what's cached for any context, per-call ones included,
+    // is stale. A remote-only flag is refetched by its next evaluation.
+    this.deleteFlagCacheEntries(flagKey);
+    if (!isLocallyEvaluable(flag)) return;
     const evaluated = Evaluator.evaluate(flag, this.context);
     const changed =
       !cached || JSON.stringify(cached.value) !== JSON.stringify(evaluated.value);
-    // Config changed — context-variant entries are stale.
-    this.deleteFlagCacheEntries(flagKey);
-    this.setCache(flagKey, {
+    const result: EvaluationResult = {
       value: evaluated.value,
-      reason: evaluated.reason,
+      reason: evaluated.reason as EvaluationResult["reason"],
       variant: evaluated.variant,
-    });
+    };
+    this.setCache(flagKey, result);
+    // What the app now shows for this flag: what an outcome goes to.
+    if (this.ownEvaluated.has(flagKey)) this.trackVariant(flagKey, result);
     this.expose(flagKey, evaluated, null, true);
     if (changed && hasListeners) {
       const changeEvent: FlagChangeEvent = {
@@ -1271,9 +1493,7 @@ export class FlaggrClient implements FlaggrClientInstance {
       for (const listener of this.flagChangeListeners.get(flagKey)!) {
         listener(changeEvent);
       }
-      for (const plugin of this.plugins) {
-        plugin.onFlagChange?.(changeEvent);
-      }
+      this.callPlugins("onFlagChange", changeEvent);
     }
   }
 
@@ -1311,8 +1531,12 @@ export class FlaggrClient implements FlaggrClientInstance {
       return;
     }
 
-    // Keyless streams (e.g. public demo services) keep EventSource.
-    if (typeof EventSource === "undefined") return;
+    // Keyless streams (e.g. public demo services) keep EventSource. A runtime
+    // without it can't stream: poll, as the keyed path does.
+    if (typeof EventSource === "undefined") {
+      this.startPollingFallback();
+      return;
+    }
     const source = new EventSource(url);
     this.stream = source;
 
@@ -1335,22 +1559,40 @@ export class FlaggrClient implements FlaggrClientInstance {
     };
 
     source.onerror = () => {
+      if (this.stream !== source) return;
       this.setConnectionState(CS.ERROR);
-      // EventSource auto-reconnects
+      // EventSource reconnects by itself after a network error (readyState
+      // CONNECTING). A refusal — any answer but a 200 text/event-stream, such
+      // as the data plane's 401 to a request without a key — closes it for
+      // good (readyState CLOSED): poll instead, as the keyed path does.
+      if (source.readyState !== 2 /* EventSource.CLOSED */) return;
+      source.close();
+      this.stream = null;
+      this.startPollingFallback();
     };
   }
 
   /**
    * Stream fallback: the stream was refused or can't run, so refresh watched
-   * flags on the batch cadence. A mode switch or destroy() stops it.
+   * flags on the batch cadence. A mode switch or destroy() stops it, as does
+   * a refused batch (batchRefused).
    */
   private startPollingFallback(): void {
     if (this.destroyed || this.batchTimer) return;
-    const interval = this.config.batchIntervalMs ?? 2000;
-    this.batchTimer = setInterval(() => {
-      void this.refreshWatchedFlags();
-    }, interval);
+    this.scheduleBatchTimer();
+    this.pollingFallback = true;
     void this.refreshWatchedFlags();
+  }
+
+  /**
+   * A batch request was refused (401/403). A refused key (or a request
+   * without one, which the data plane refuses) won't be accepted on a retry:
+   * the stream's polling fallback stops, rather than sending a request that
+   * fails every batchIntervalMs for as long as the page is open. The client
+   * stays in the ERROR state its stream left it in.
+   */
+  private batchRefused(): void {
+    if (this.pollingFallback) this.stopBatchTimer();
   }
 
   /**
@@ -1408,9 +1650,7 @@ export class FlaggrClient implements FlaggrClientInstance {
             listener(changeEvent);
           }
         }
-        for (const plugin of this.plugins) {
-          plugin.onFlagChange?.({ flagKey: data.flagKey, newValue: data.value as FlagValue });
-        }
+        this.callPlugins("onFlagChange", { flagKey: data.flagKey, newValue: data.value as FlagValue });
       }
     } else if (data.flagKey) {
       const changeEvent: FlagChangeEvent = {
@@ -1425,7 +1665,13 @@ export class FlaggrClient implements FlaggrClientInstance {
         reason: (data.reason as EvaluationResult["reason"]) ?? "STATIC",
         variant: data.variant,
       };
+      // The flag changed: what's cached for per-call contexts is stale too.
+      this.deleteFlagCacheEntries(data.flagKey);
       this.setCache(data.flagKey, result);
+      // The value pushed for the client's own context: what an outcome goes to.
+      if (data.value !== undefined && this.ownEvaluated.has(data.flagKey)) {
+        this.trackVariant(data.flagKey, result);
+      }
       this.expose(data.flagKey, result, null, true);
 
       // Notify listeners
@@ -1437,9 +1683,7 @@ export class FlaggrClient implements FlaggrClientInstance {
       }
 
       // Notify plugins
-      for (const plugin of this.plugins) {
-        plugin.onFlagChange?.(changeEvent);
-      }
+      this.callPlugins("onFlagChange", changeEvent);
     }
   }
 }

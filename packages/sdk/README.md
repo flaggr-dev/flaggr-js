@@ -43,13 +43,13 @@ The browser bundle (`dist/browser.global.js`) sets up a global `flaggr` from the
 </script>
 ```
 
-`https://cdn.flaggr.dev/sdk.js` serves the npm release tagged `latest`, once Flaggr has added it to the CDN; `https://cdn.jsdelivr.net/npm/@flaggr/sdk@0/dist/browser.global.js` serves the newest 0.x release. Pinned copies with Subresource Integrity hashes are listed in [`https://cdn.flaggr.dev/manifest.json`](https://cdn.flaggr.dev/manifest.json). From 0.5.0, `data-api-url` is optional and defaults to `https://api.flaggr.dev`; 0.4.0 needs it, or it sends evaluations to `<page>/undefined/api/flags/evaluate`.
+`https://cdn.flaggr.dev/sdk.js` serves the release Flaggr has pinned for it, whatever npm tags `latest` (a new npm release reaches it only once Flaggr adds it); `https://cdn.jsdelivr.net/npm/@flaggr/sdk@0/dist/browser.global.js` serves the newest 0.x release. [`https://cdn.flaggr.dev/manifest.json`](https://cdn.flaggr.dev/manifest.json) shows the version `/sdk.js` serves (`latest["/sdk.js"]`) and lists pinned copies with Subresource Integrity hashes. From 0.5.0, `data-api-url` is optional and defaults to `https://api.flaggr.dev`; 0.4.0 needs it, or it sends evaluations to `<page>/undefined/api/flags/evaluate`.
 
 Other attributes: `data-update-mode`, `data-remote-config`, `data-telemetry` and `data-expose-flags="false"`. See the [script tag docs](https://flaggr.dev/docs/sdk/typescript-sdk#script-tag).
 
 ## Streaming
 
-`updateMode: "stream"` (or `enableStreaming: true`) with an `apiKey` streams flag configuration over `fetch` with the key in the `Authorization` header, never in the URL. Evaluation then runs locally from the streamed configuration, with no network round trip (flags using operators the data plane doesn't implement are still evaluated remotely). The SDK reconnects with backoff, and if the stream refuses the key (401/403) it polls watched flags every `batchIntervalMs` instead. Keyless clients use `EventSource`. Call `client.destroy()` when you're done with a streaming client, including on the server (Node 18+).
+`updateMode: "stream"` (or `enableStreaming: true`) with an `apiKey` streams flag configuration over `fetch` with the key in the `Authorization` header, never in the URL. Evaluation then runs locally from the streamed configuration, with no network round trip (flags using operators the data plane doesn't implement are still evaluated remotely). Local evaluation uses `@flaggr/evaluator` 0.3.0: a targeting rule with no conditions matches everyone (deployments of `api.flaggr.dev` from before Flaggr 0.5.0 match it to nobody), a context without a `targetingKey` is never in a rollout below 100%, and a field the data plane sends as `null`, such as an unset `rolloutPercentage`, is unset. The SDK reconnects with backoff, and if the stream refuses the key (401/403) it polls watched flags every `batchIntervalMs` instead. Keyless clients use `EventSource`, which works only for public demo services with `apiUrl: "https://flaggr.dev"`: the data plane answers 401 to a stream without a key, and the client then polls watched flags every `batchIntervalMs`, as it does where `EventSource` doesn't exist. Call `client.destroy()` when you're done with a streaming client, including on the server (Node 18+).
 
 ## React
 
@@ -72,7 +72,7 @@ function Checkout() {
 
 `FlaggrProvider` also takes a `config` object with any `createFlaggr` option; when you pass the `serviceId` prop, the `apiKey`, `serviceId` and `environment` props override the same fields in it. Hooks return the flag's value.
 
-In the Next.js App Router, `@flaggr/sdk/react` must be imported from Client Components: it creates a React context when it loads and has no `'use client'` directive. Render `FlaggrProvider` from a `'use client'` file such as `app/providers.tsx`, wrap your root layout's children with it, and call the hooks in Client Components. Pass `NEXT_PUBLIC_` values as props, since the SDK's own environment lookup can't see them in a browser bundle. See [React hooks](https://flaggr.dev/docs/sdk/react-hooks#nextjs-app-router).
+In the Next.js App Router, `@flaggr/sdk/react` starts with a `'use client'` directive, so a Server Component can render `FlaggrProvider` with serializable props. Its props reach the browser, so give it only a key that's safe there. Render it from a `'use client'` file (such as `app/providers.tsx`) when `config` holds functions such as `plugins`, and call the hooks in Client Components. `NEXT_PUBLIC_FLAGGR_*` values set at build time reach browser bundles. See [React hooks](https://flaggr.dev/docs/sdk/react-hooks#nextjs-app-router).
 
 ## Browser analytics
 
@@ -92,7 +92,8 @@ const client = createFlaggr({ serviceId: 'web-app', apiKey: 'fgr_xxx', exposeFla
 ```
 
 ```html
-<script src="https://cdn.flaggr.dev/sdk.js" data-service-id="web-app" data-expose-flags="false" defer></script>
+<script src="https://cdn.flaggr.dev/sdk.js" data-service-id="web-app" data-api-key="fgr_xxx"
+        data-api-url="https://api.flaggr.dev" data-expose-flags="false" defer></script>
 ```
 
 ## OpenTelemetry

@@ -16,7 +16,7 @@
  *
  * const client = createFlaggr({
  *   serviceId: 'web-app',
- *   apiKey: 'flg_xxx',
+ *   apiKey: 'fgr_xxx',
  * })
  *
  * const isEnabled = await client.getBooleanValue('my-feature', false)
@@ -29,7 +29,7 @@
  *
  * const client = createFlaggr({
  *   serviceId: 'web-app',
- *   apiKey: 'flg_xxx',
+ *   apiKey: 'fgr_xxx',
  *   plugins: [otelPlugin({ serviceName: 'checkout' })],
  * })
  * ```
@@ -40,7 +40,7 @@
  *
  * function App() {
  *   return (
- *     <FlaggrProvider apiKey="flg_xxx" serviceId="web">
+ *     <FlaggrProvider apiKey="fgr_xxx" serviceId="web">
  *       <MyComponent />
  *     </FlaggrProvider>
  *   )

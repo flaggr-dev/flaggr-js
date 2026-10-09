@@ -50,12 +50,13 @@ export const GO_SUPPORTED_OPERATORS: ReadonlySet<string> = new Set([
  * remotely.
  */
 export function isLocallyEvaluable(flag: FlagConfig): boolean {
-  for (const rule of flag.targeting ?? []) {
+  for (const rule of Array.isArray(flag.targeting) ? flag.targeting : []) {
+    if (!isObject(rule)) continue;
     for (const cond of rule.conditions ?? []) {
       if (!GO_SUPPORTED_OPERATORS.has(cond.operator)) return false;
     }
     for (const group of rule.groups ?? []) {
-      for (const cond of group.conditions ?? []) {
+      for (const cond of group?.conditions ?? []) {
         if (!GO_SUPPORTED_OPERATORS.has(cond.operator)) return false;
       }
     }
@@ -71,6 +72,10 @@ export class Evaluator {
    * Evaluates a flag configuration against an evaluation context.
    * Order (Go parity): disabled → overrides → targeting rules (schedule →
    * conditions/groups → rollout %) → variants → default.
+   *
+   * Reads the data plane's JSON (/api/flags/export, its SSE configuration
+   * events) as the data plane does: a field it encodes as null or "" is unset,
+   * and an entry of targeting or overrides that isn't an object is skipped.
    */
   static evaluate(
     flag: FlagConfig,
@@ -84,10 +89,10 @@ export class Evaluator {
     }
 
     // Overrides — identity match, priority-sorted (highest first)
-    if (flag.overrides && flag.overrides.length > 0 && context.targetingKey) {
-      const sorted = [...flag.overrides].sort(
-        (a, b) => (b.priority ?? 0) - (a.priority ?? 0)
-      );
+    if (Array.isArray(flag.overrides) && flag.overrides.length > 0 && context.targetingKey) {
+      const sorted = flag.overrides
+        .filter(isObject)
+        .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
       for (const override of sorted) {
         if (override.identifiers?.includes(context.targetingKey)) {
           return { value: override.value, reason: "OVERRIDE" };
@@ -96,21 +101,23 @@ export class Evaluator {
     }
 
     // Targeting rules
-    if (flag.targeting && flag.targeting.length > 0) {
+    if (Array.isArray(flag.targeting) && flag.targeting.length > 0) {
       for (const rule of flag.targeting) {
+        // Not an object (null, or junk an import stored): no rule. Read as
+        // one, it would have no conditions and match everyone.
+        if (!isObject(rule)) continue;
         if (!isWithinSchedule(rule.schedule)) continue;
         if (this.evaluateRule(rule, context)) {
           if (
-            rule.rolloutPercentage !== undefined &&
+            rule.rolloutPercentage != null &&
             rule.rolloutPercentage < 100 &&
             !isInRollout(flag.key, context.targetingKey ?? "", rule.rolloutPercentage)
           ) {
             continue;
           }
-          const value = rule.value !== undefined ? rule.value : flag.defaultValue;
           return {
-            value,
-            variant: rule.variant,
+            value: rule.value != null ? rule.value : flag.defaultValue,
+            variant: rule.variant || undefined,
             reason: "TARGETING_MATCH",
           };
         }
@@ -169,47 +176,56 @@ export class Evaluator {
   }
 
   /**
-   * Evaluates a targeting rule against the context.
-   * Groups take precedence over flat conditions (Go parity).
+   * Evaluates a targeting rule against the context (Go parity). A rule with
+   * condition groups is decided by its groups; otherwise its flat conditions
+   * combine with conditionOperator ("and" by default). A rule with neither
+   * conditions nor groups matches everyone, so `conditions: []` with a
+   * rolloutPercentage rolls the rule's value out to that share of all users.
+   * The cases in test/rule-matching-cases.json pin these semantics for this
+   * evaluator, the control plane's and the Go data plane's.
    */
   private static evaluateRule(
     rule: TargetingRule,
     context: EvaluationContext
   ): boolean {
-    if (rule.groups && rule.groups.length > 0) {
+    if (Array.isArray(rule.groups) && rule.groups.length > 0) {
       return this.evaluateGroups(rule.groups, rule.groupOperator || "or", context);
     }
 
-    if (!rule.conditions || rule.conditions.length === 0) {
-      return false;
+    // No groups and no conditions: the rule matches everyone.
+    const conditions = rule.conditions;
+    if (!Array.isArray(conditions) || conditions.length === 0) {
+      return true;
     }
 
     const operator = rule.conditionOperator || "and";
 
     if (operator === "or") {
-      return rule.conditions.some((condition: Condition) =>
+      return conditions.some((condition: Condition) =>
         this.evaluateCondition(condition, context)
       );
     }
 
     // Default: AND logic
-    return rule.conditions.every((condition: Condition) =>
+    return conditions.every((condition: Condition) =>
       this.evaluateCondition(condition, context)
     );
   }
 
   /**
    * Evaluates condition groups: each group ANDs its conditions, groups combine
-   * with the group operator (default "or") — Go parity.
+   * with the group operator (default "or") — Go parity. A group without
+   * conditions matches nobody.
    */
   private static evaluateGroups(
-    groups: ConditionGroup[],
+    groups: Array<ConditionGroup | null>,
     groupOp: string,
     context: EvaluationContext
   ): boolean {
-    const evalGroup = (g: ConditionGroup): boolean => {
-      if (!g.conditions || g.conditions.length === 0) return false;
-      return g.conditions.every((cond) => this.evaluateCondition(cond, context));
+    const evalGroup = (g: ConditionGroup | null): boolean => {
+      const conditions = g?.conditions;
+      if (!Array.isArray(conditions) || conditions.length === 0) return false;
+      return conditions.every((cond) => this.evaluateCondition(cond, context));
     };
 
     if (groupOp === "or") {
@@ -388,7 +404,9 @@ export function hashString(str: string): number {
 
 /**
  * Gradual rollout bucket check — Go parity:
- * hash(flagKey + ":rollout:" + targetingKey) % 100 < percentage
+ * hash(flagKey + ":rollout:" + targetingKey) % 100 < percentage. Without a
+ * targeting key there is no bucket, so a partial rollout leaves the context
+ * out.
  */
 export function isInRollout(
   flagKey: string,
@@ -397,7 +415,13 @@ export function isInRollout(
 ): boolean {
   if (percentage === 0) return false;
   if (percentage >= 100) return true;
+  if (!targetingKey) return false;
   return hashString(`${flagKey}:rollout:${targetingKey}`) % 100 < percentage;
+}
+
+/** A JSON object (not null, not an array): what a rule or an override must be. */
+function isObject<T>(value: T): value is T & object {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -432,7 +456,7 @@ function parseDate(value: unknown): Date | null {
  * Schedule gating — Go parity (IsWithinSchedule). All times are UTC.
  */
 export function isWithinSchedule(
-  schedule: RuleSchedule | undefined,
+  schedule: RuleSchedule | null | undefined,
   now: Date = new Date()
 ): boolean {
   if (!schedule) return true;
