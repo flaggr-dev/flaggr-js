@@ -149,3 +149,15 @@ export { readEnvConfig } from "./env";
 // Browser telemetry plugin (opt-in)
 export { flaggrTelemetry } from "./telemetry";
 export type { TelemetryOptions } from "./telemetry";
+
+// Error tracking: crashes and errors with the active flag variants, grouped into issues
+export { flaggrErrors, captureException, captureMessage, addBreadcrumb, setUser } from "./errors";
+export type {
+  Breadcrumb,
+  CaptureContext,
+  ErrorEvent as FlaggrErrorEvent,
+  ErrorLevel,
+  ErrorTrackingOptions,
+  ErrorUser,
+  FlaggrErrors,
+} from "./errors";

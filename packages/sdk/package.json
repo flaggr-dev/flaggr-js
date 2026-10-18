@@ -1,6 +1,6 @@
 {
   "name": "@flaggr/sdk",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Flaggr feature flag SDK for TypeScript \u2014 type-safe evaluation with pluggable OpenTelemetry instrumentation",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

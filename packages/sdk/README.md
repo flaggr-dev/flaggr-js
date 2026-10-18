@@ -96,6 +96,17 @@ const client = createFlaggr({ serviceId: 'web-app', apiKey: 'fgr_xxx', exposeFla
         data-api-url="https://api.flaggr.dev" data-expose-flags="false" defer></script>
 ```
 
+## Error tracking
+
+```ts
+import { createFlaggr, flaggrErrors, captureException } from "@flaggr/sdk";
+
+createFlaggr({ serviceId: "web-app", apiKey: "fgr_...", plugins: [flaggrErrors({ release: "web@1.4.2" })] });
+captureException(error, { tags: { step: "pay" } });
+```
+
+Uncaught errors are reported automatically, with the flag variants the client evaluated and the breadcrumbs that led up to them. They show up as issues in the Flaggr console. On a server, set `FLAGGR_ERRORS_TOKEN` (or `serverToken`) to a project API token. See [Error Tracking](https://flaggr.dev/docs/sdk/typescript-sdk#error-tracking).
+
 ## OpenTelemetry
 
 ```typescript
