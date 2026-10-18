@@ -672,7 +672,8 @@ describe("exposeFlags: publishing resolved values for browser analytics", () => 
     expect(page.__FLAGGR_FLAGS__).toBeUndefined();
     await expect(client.getStringValue("remote-copy", "control")).resolves.toBe("member-copy");
     client.destroy();
-    localStorage.clear();
+    // Node 26's own localStorage (undefined without --localstorage-file) shadows jsdom's; the client then caches nothing.
+    globalThis.localStorage?.clear();
   });
 
   it("doesn't publish values evaluated for someone else", async () => {
