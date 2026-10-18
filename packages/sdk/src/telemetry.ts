@@ -30,6 +30,7 @@
  */
 
 import { appBaseUrl } from "./app-url";
+import { errorTrackingActive } from "./errors";
 import { fetchWithKeepalive, fitsKeepaliveBudget } from "./keepalive";
 import type {
   EvaluationResult,
@@ -359,6 +360,8 @@ export function flaggrTelemetry(options: TelemetryOptions = {}): FlaggrPlugin {
 
       if (captureErrors) {
         onError = (e: ErrorEvent) => {
+          // flaggrErrors() reports it in full (stack, breadcrumbs, release): don't count it twice.
+          if (errorTrackingActive()) return;
           errorLog.push({ message: e.message ?? "unknown", flags: { ...activeFlags }, ts: Date.now() });
           if (errorLog.length > 100) errorLog.splice(0, errorLog.length - 100);
         };

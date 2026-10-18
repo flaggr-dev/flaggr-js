@@ -8,7 +8,8 @@
  * </script>
  */
 
-import { configure, flaggrTelemetry } from "./index";
+import { configure, flaggrErrors, flaggrTelemetry } from "./index";
+import { getGlobalClient } from "./global";
 import { recordOptOut } from "./expose-flags";
 import type { FlaggrConfig, UpdateMode } from "./types";
 
@@ -20,6 +21,11 @@ export {
   resetGlobalClient,
   flag,
   flaggrTelemetry,
+  flaggrErrors,
+  captureException,
+  captureMessage,
+  addBreadcrumb,
+  setUser,
 } from "./index";
 
 /**
@@ -31,7 +37,8 @@ export {
  *   <script>await flaggr.flag("checkout-v2", false)</script>
  *
  * Optional: data-api-url (default https://api.flaggr.dev), data-environment,
- * data-update-mode, data-remote-config, data-telemetry.
+ * data-update-mode, data-remote-config, data-telemetry, data-errors (error
+ * tracking, with data-release naming your app's version).
  */
 if (typeof document !== "undefined") {
   // data-expose-flags="false" on any script tag now keeps flag values off
@@ -58,12 +65,20 @@ if (typeof document !== "undefined") {
     // data-telemetry → attach the telemetry plugin (eval stats + Web Vitals
     // + error correlation, beacon-flushed to the platform)
     if (tag.dataset.telemetry !== undefined) config.plugins = [flaggrTelemetry()];
+    // data-errors → error tracking (flaggrErrors), data-release its release.
+    const trackErrors = tag.dataset.errors !== undefined && tag.dataset.errors !== "false";
+    if (trackErrors) {
+      config.plugins = [...(config.plugins ?? []), flaggrErrors(tag.dataset.release ? { release: tag.dataset.release } : {})];
+    }
     // data-expose-flags="false" (on this or any script tag) keeps flag
     // values off the page. It isn't passed here: every client reads it
     // from the page (and recordOptOut above), so it still applies after a
     // later configure() and to createFlaggr() clients (see shouldExpose in
     // expose-flags.ts).
     configure(config);
+    // The global client is made at the first flaggr.flag(); errors before
+    // then would be missed, so error tracking makes it now.
+    if (trackErrors) getGlobalClient();
   }
 }
 
